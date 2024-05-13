@@ -120,6 +120,7 @@ jobs:
       sudo /sbin/ip link add Vrf1 type vrf table 1001 || { echo 'vrf command failed' ; exit 1; }
       sudo /sbin/ip link del Vrf1 type vrf table 1001
       pushd tests
+      mkdir -p logs
 
       params=""
       if [ '${{ parameters.archive_gcov }}' == True ]; then
@@ -173,6 +174,7 @@ jobs:
 
   - script: |
       cp -r tests/log $(Build.ArtifactStagingDirectory)/
+      cp -r tests/logs $(Build.ArtifactStagingDirectory)/
 
       if [ '${{ parameters.asan }}' == True ]; then
         cp -vr tests/log/*/log/asan $(Build.ArtifactStagingDirectory)/
