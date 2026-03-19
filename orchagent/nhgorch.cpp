@@ -2,28 +2,25 @@
 #include "neighorch.h"
 #include "crmorch.h"
 #include "routeorch.h"
+#include "srv6orch.h"
 #include "bulker.h"
 #include "logger.h"
 #include "swssnet.h"
 
 extern sai_object_id_t gSwitchId;
 
-extern PortsOrch *gPortsOrch;
-extern CrmOrch *gCrmOrch;
+extern IntfsOrch *gIntfsOrch;
 extern NeighOrch *gNeighOrch;
 extern RouteOrch *gRouteOrch;
 extern NhgOrch *gNhgOrch;
+extern Srv6Orch *gSrv6Orch;
 
 extern size_t gMaxBulkSize;
 
 extern sai_next_hop_group_api_t* sai_next_hop_group_api;
 extern sai_next_hop_api_t*         sai_next_hop_api;
-extern sai_switch_api_t*            sai_switch_api;
 
-unsigned int NextHopGroup::m_count = 0;
-
-NhgOrch::NhgOrch(DBConnector *db, string tableName) :
-    Orch(db, tableName)
+NhgOrch::NhgOrch(DBConnector *db, string tableName) : NhgOrchCommon(db, tableName)
 {
     SWSS_LOG_ENTER();
 }
@@ -64,46 +61,187 @@ void NhgOrch::doTask(Consumer& consumer)
             string aliases;
             string weights;
             string mpls_nhs;
+            string nhgs;
+            bool is_recursive = false;
+            string srv6_source;
+            bool overlay_nh = false;
+            bool srv6_nh = false;
 
             /* Get group's next hop IPs and aliases */
             for (auto i : kfvFieldsValues(t))
             {
-                if (fvField(i) == "nexthop")
+                if (fvField(i) == "nexthop" && fvValue(i) != "")
                     ips = fvValue(i);
 
-                if (fvField(i) == "ifname")
+                if (fvField(i) == "ifname" && fvValue(i) != "")
                     aliases = fvValue(i);
 
-                if (fvField(i) == "weight")
+                if (fvField(i) == "weight" && fvValue(i) != "")
                     weights = fvValue(i);
 
-                if (fvField(i) == "mpls_nh")
+                if (fvField(i) == "mpls_nh" && fvValue(i) != "")
                     mpls_nhs = fvValue(i);
-            }
 
-            /* Split ips and alaises strings into vectors of tokens. */
+                if (fvField(i) == "seg_src" && fvValue(i) != "")
+                {
+                    srv6_source = fvValue(i);
+                    srv6_nh = true;
+                }
+
+                if (fvField(i) == "nexthop_group" && fvValue(i) != "")
+                {
+                    nhgs = fvValue(i);
+                    is_recursive = true;
+                }
+            }
+            /* A NHG should not have both regular(ip/alias) and recursive fields */
+            if (is_recursive && (!ips.empty() || !aliases.empty()))
+            {
+                SWSS_LOG_ERROR("Nexthop group %s has both regular(ip/alias) and recursive fields", index.c_str());
+                it = consumer.m_toSync.erase(it);
+                continue;
+            }
+            /* Split ips and aliases strings into vectors of tokens. */
             vector<string> ipv = tokenize(ips, ',');
             vector<string> alsv = tokenize(aliases, ',');
             vector<string> mpls_nhv = tokenize(mpls_nhs, ',');
+            vector<string> nhgv = tokenize(nhgs, NHG_DELIMITER);
+            vector<string> srv6_srcv = tokenize(srv6_source, ',');
 
             /* Create the next hop group key. */
             string nhg_str;
+            NextHopGroupKey nhg_key;
 
-            for (uint32_t i = 0; i < ipv.size(); i++)
+            /* Keeps track of any non-existing member of a recursive nexthop group */
+            bool non_existent_member = false;
+
+            if (is_recursive)
             {
-                if (i) nhg_str += NHG_DELIMITER;
-                if (!mpls_nhv.empty() && mpls_nhv[i] != "na")
-                {
-                    nhg_str += mpls_nhv[i] + LABELSTACK_DELIMITER;
-                }
-                nhg_str += ipv[i] + NH_DELIMITER + alsv[i];
-            }
+                SWSS_LOG_INFO("Adding recursive nexthop group %s with %s", index.c_str(), nhgs.c_str());
 
-            NextHopGroupKey nhg_key = NextHopGroupKey(nhg_str, weights);
+                /* Reset the "nexthop_group" field and update it with only the existing members */
+                nhgs = "";
+
+                /* Check if any of the members are a recursive or temporary nexthop group */
+                bool invalid_member = false;
+
+                for (auto& nhgm : nhgv)
+                {
+                    const auto& nhgm_it = m_syncdNextHopGroups.find(nhgm);
+                    if (nhgm_it == m_syncdNextHopGroups.end())
+                    {
+                        SWSS_LOG_INFO("Member nexthop group %s in parent nhg %s not ready",
+                                nhgm.c_str(), index.c_str());
+
+                        non_existent_member = true;
+                        continue;
+                    }
+                    if ((nhgm_it->second.nhg) &&
+                        (nhgm_it->second.nhg->isRecursive() || nhgm_it->second.nhg->isTemp()))
+                    {
+                        SWSS_LOG_ERROR("Invalid member nexthop group %s in parent nhg %s",
+                                nhgm.c_str(), index.c_str());
+
+                        invalid_member = true;
+                        break;
+                    }
+                    /* Keep only the members which exist in the local cache */
+                    if (nhgs.empty())
+                        nhgs = nhgm;
+                    else
+                        nhgs += NHG_DELIMITER + nhgm;
+                }
+                if (invalid_member)
+                {
+                    it = consumer.m_toSync.erase(it);
+                    continue;
+                }
+                /* If no members are present */
+                if (nhgs.empty())
+                {
+                    it++;
+                    continue;
+                }
+
+                /* Form nexthopgroup key with the nexthopgroup keys of available members */
+                nhgv = tokenize(nhgs, NHG_DELIMITER);
+
+                bool nhg_mismatch = false;
+                for (uint32_t i = 0; i < nhgv.size(); i++)
+                {
+                    auto k = m_syncdNextHopGroups.at(nhgv[i]).nhg->getKey();
+                    if (i)
+                    {
+                        if (k.is_srv6_nexthop() != srv6_nh || k.is_overlay_nexthop() != overlay_nh)
+                        {
+                            SWSS_LOG_ERROR("Inconsistent nexthop group type between %s and %s",
+                                m_syncdNextHopGroups.at(nhgv[0]).nhg->getKey().to_string().c_str(),
+                                k.to_string().c_str());
+                            nhg_mismatch = true;
+                            break;
+                        }
+                        nhg_str += NHG_DELIMITER;
+                    }
+                    else
+                    {
+                        srv6_nh = k.is_srv6_nexthop();
+                        overlay_nh = k.is_overlay_nexthop();
+                    }
+
+                    nhg_str += m_syncdNextHopGroups.at(nhgv[i]).nhg->getKey().to_string();
+                }
+
+                if (nhg_mismatch)
+                {
+                    it = consumer.m_toSync.erase(it);
+                    continue;
+                }
+
+                if (srv6_nh)
+                    nhg_key = NextHopGroupKey(nhg_str, overlay_nh, srv6_nh);
+                else
+                    nhg_key = NextHopGroupKey(nhg_str, weights);
+            }
+            else
+            {
+                if (srv6_nh)
+                {
+                    if (ipv.size() != srv6_srcv.size())
+                    {
+                        SWSS_LOG_ERROR("inconsistent number of endpoints and srv6_srcs.");
+                        it = consumer.m_toSync.erase(it);
+                        continue;
+                    }
+                    for (uint32_t i = 0; i < ipv.size(); i++)
+                    {
+                        if (i) nhg_str += NHG_DELIMITER;
+                        nhg_str += ipv[i] + NH_DELIMITER;       // ip address
+                        nhg_str += NH_DELIMITER;                // srv6 segment
+                        nhg_str += srv6_srcv[i] + NH_DELIMITER; // srv6 source
+                        nhg_str += NH_DELIMITER;                // srv6 vpn sid
+                    }
+                    nhg_key = NextHopGroupKey(nhg_str, overlay_nh, srv6_nh);
+                }
+                else
+                {
+                    for (uint32_t i = 0; i < ipv.size(); i++)
+                    {
+                        if (i) nhg_str += NHG_DELIMITER;
+                        if (!mpls_nhv.empty() && mpls_nhv[i] != "na")
+                        {
+                            nhg_str += mpls_nhv[i] + LABELSTACK_DELIMITER;
+                        }
+                        nhg_str += ipv[i] + NH_DELIMITER + alsv[i];
+                    }
+                    nhg_key = NextHopGroupKey(nhg_str, weights);
+                }
+            }
 
             /* If the group does not exist, create one. */
             if (nhg_it == m_syncdNextHopGroups.end())
             {
+                SWSS_LOG_INFO("Create nexthop group %s with %s", index.c_str(), nhg_str.c_str());
+
                 /*
                 * If we've reached the NHG limit, we're going to create a temporary
                 * group, represented by one of it's NH only until we have
@@ -111,16 +249,23 @@ void NhgOrch::doTask(Consumer& consumer)
                 * to be kept in the sync list so we keep trying to create the
                 * actual group when there are enough resources.
                 */
-                if (gRouteOrch->getNhgCount() + NextHopGroup::getCount() >= gRouteOrch->getMaxNhgCount())
+                if (gRouteOrch->getNhgCount() + NextHopGroup::getSyncedCount() >= gRouteOrch->getMaxNhgCount())
                 {
                     SWSS_LOG_DEBUG("Next hop group count reached its limit.");
+
+                    // don't create temp nhg for srv6
+                    if (nhg_key.is_srv6_nexthop())
+                    {
+                        ++it;
+                        continue;
+                    }
 
                     try
                     {
                         auto nhg = std::make_unique<NextHopGroup>(createTempNhg(nhg_key));
                         if (nhg->sync())
                         {
-                            m_syncdNextHopGroups.emplace(index, NhgEntry(std::move(nhg)));
+                            m_syncdNextHopGroups.emplace(index, NhgEntry<NextHopGroup>(std::move(nhg)));
                         }
                         else
                         {
@@ -139,17 +284,30 @@ void NhgOrch::doTask(Consumer& consumer)
                 else
                 {
                     auto nhg = std::make_unique<NextHopGroup>(nhg_key, false);
-                    success = nhg->sync();
 
+                    /* 
+                    * Mark the nexthop group as recursive so as to create a
+                    * nexthop group object even if it has just one available path
+                    */
+                    nhg->setRecursive(is_recursive);
+
+                    success = nhg->sync();
                     if (success)
                     {
-                        m_syncdNextHopGroups.emplace(index, NhgEntry(std::move(nhg)));
+                        /* Keep the msg in loop if any member path is not available yet */
+                        if (is_recursive && non_existent_member)
+                        {
+                            success = false;
+                        }
+                        m_syncdNextHopGroups.emplace(index, NhgEntry<NextHopGroup>(std::move(nhg)));
                     }
                 }
             }
             /* If the group exists, update it. */
             else
             {
+                SWSS_LOG_INFO("Update nexthop group %s with %s", index.c_str(), nhg_str.c_str());
+
                 const auto& nhg_ptr = nhg_it->second.nhg;
 
                 /*
@@ -159,7 +317,7 @@ void NhgOrch::doTask(Consumer& consumer)
                  * resources.
                  */
                 if (nhg_ptr->isTemp() &&
-                    (gRouteOrch->getNhgCount() + NextHopGroup::getCount() >= gRouteOrch->getMaxNhgCount()))
+                    (gRouteOrch->getNhgCount() + NextHopGroup::getSyncedCount() >= gRouteOrch->getMaxNhgCount()))
                 {
                     /*
                      * If the group was updated in such way that the previously
@@ -222,13 +380,31 @@ void NhgOrch::doTask(Consumer& consumer)
                 else
                 {
                     success = nhg_ptr->update(nhg_key);
+
+                    /* Keep the msg in loop if any member path is not available yet */
+                    if (is_recursive && non_existent_member)
+                    {
+                        success = false;
+                    }
                 }
             }
         }
         else if (op == DEL_COMMAND)
         {
+            /*
+             * If there is a pending SET after this DEL operation, skip the
+             * DEL operation to perform the update instead.  Otherwise, in the
+             * scenario where the DEL operation may be blocked by the ref
+             * counter, we'd end up deleting the object after the SET operation
+             * is performed, which would not reflect the desired state of the
+             * object.
+             */
+            if (consumer.m_toSync.count(it->first) > 1)
+            {
+                success = true;
+            }
             /* If the group does not exist, do nothing. */
-            if (nhg_it == m_syncdNextHopGroups.end())
+            else if (nhg_it == m_syncdNextHopGroups.end())
             {
                 SWSS_LOG_INFO("Unable to find group with key %s to remove", index.c_str());
                 /* Mark the operation as successful to consume it. */
@@ -292,7 +468,7 @@ bool NhgOrch::validateNextHop(const NextHopKey& nh_key)
     {
         auto& nhg = it.second.nhg;
 
-        if (nhg->hasNextHop(nh_key))
+        if (nhg->hasMember(nh_key))
         {
             /*
              * If sync fails, exit right away, as we expect it to be due to a
@@ -332,7 +508,7 @@ bool NhgOrch::invalidateNextHop(const NextHopKey& nh_key)
     {
         auto& nhg = it.second.nhg;
 
-        if (nhg->hasNextHop(nh_key))
+        if (nhg->hasMember(nh_key))
         {
             /* If the remove fails, exit right away. */
             if (!nhg->invalidateNextHop(nh_key))
@@ -349,37 +525,6 @@ bool NhgOrch::invalidateNextHop(const NextHopKey& nh_key)
 }
 
 /*
- * Purpose:     Increase the ref count for a next hop group.
- * Description: Increment the ref count for a next hop group by 1.
- * Params:      IN  index - The index of the next hop group.
- * Returns:     Nothing.
- */
-void NhgOrch::incNhgRefCount(const std::string& index)
-{
-    SWSS_LOG_ENTER();
-
-    NhgEntry& nhg_entry = m_syncdNextHopGroups.at(index);
-    ++nhg_entry.ref_count;
-}
-
-/*
- * Purpose:     Decrease the ref count for a next hop group.
- * Description: Decrement the ref count for a next hop group by 1.
- * Params:      IN  index - The index of the next hop group.
- * Returns:     Nothing.
- */
-void NhgOrch::decNhgRefCount(const std::string& index)
-{
-    SWSS_LOG_ENTER();
-
-    NhgEntry& nhg_entry = m_syncdNextHopGroups.at(index);
-
-    /* Sanity check so we don't overflow. */
-    assert(nhg_entry.ref_count > 0);
-    --nhg_entry.ref_count;
-}
-
-/*
  * Purpose:     Get the next hop ID of the member.
  * Description: Get the SAI ID of the next hop from NeighOrch.
  * Params:      None.
@@ -392,9 +537,21 @@ sai_object_id_t NextHopGroupMember::getNhId() const
 
     sai_object_id_t nh_id = SAI_NULL_OBJECT_ID;
 
-    if (gNeighOrch->hasNextHop(m_nh_key))
+    if (m_key.isIntfNextHop())
     {
-        nh_id = gNeighOrch->getNextHopId(m_nh_key);
+        nh_id = gIntfsOrch->getRouterIntfsId(m_key.alias);
+    }
+    else if (gNeighOrch->hasNextHop(m_key))
+    {
+        nh_id = gNeighOrch->getNextHopId(m_key);
+        if (m_key.isSrv6NextHop())
+        {
+            SWSS_LOG_INFO("Single NH: create srv6 nexthop %s", m_key.to_string(false, true).c_str());
+            if (!gSrv6Orch->createSrv6NexthopWithoutVpn(m_key, nh_id))
+            {
+                SWSS_LOG_ERROR("Failed to create SRv6 nexthop %s", m_key.to_string(false, true).c_str());
+            }
+        }
     }
     /*
      * If the next hop is labeled and the IP next hop exists, create the
@@ -403,33 +560,33 @@ sai_object_id_t NextHopGroupMember::getNhId() const
      * after the object is created and would never create the labeled next hop
      * afterwards.
      */
-    else if (isLabeled() && gNeighOrch->isNeighborResolved(m_nh_key))
+    else if (isLabeled() && gNeighOrch->isNeighborResolved(m_key))
     {
-        gNeighOrch->addNextHop(m_nh_key);
-        nh_id = gNeighOrch->getNextHopId(m_nh_key);
+        NeighborContext ctx = NeighborContext(m_key);
+        if (gNeighOrch->addNextHop(ctx))
+        {
+            nh_id = gNeighOrch->getNextHopId(m_key);
+        }
     }
     else
     {
-        gNeighOrch->resolveNeighbor(m_nh_key);
+        if (m_key.isSrv6NextHop())
+        {
+            SWSS_LOG_INFO("Single NH: create srv6 nexthop %s", m_key.to_string(false, true).c_str());
+            if (!gSrv6Orch->createSrv6NexthopWithoutVpn(m_key, nh_id))
+            {
+                SWSS_LOG_ERROR("Failed to create SRv6 nexthop %s", m_key.to_string(false, true).c_str());
+            }
+        }
+        else
+        {
+            SWSS_LOG_INFO("Failed to get next hop %s, resolving neighbor",
+                m_key.to_string().c_str());
+            gNeighOrch->resolveNeighbor(m_key);
+        }
     }
 
     return nh_id;
-}
-
-/*
- * Purpose:     Move assignment operator.
- * Description: Perform member-wise swap.
- * Params:      IN  nhgm - The next hop group member to swap.
- * Returns:     Reference to this object.
- */
-NextHopGroupMember& NextHopGroupMember::operator=(NextHopGroupMember&& nhgm)
-{
-    SWSS_LOG_ENTER();
-
-    std::swap(m_nh_key, nhgm.m_nh_key);
-    std::swap(m_gm_id, nhgm.m_gm_id);
-
-    return *this;
 }
 
 /*
@@ -446,13 +603,13 @@ bool NextHopGroupMember::updateWeight(uint32_t weight)
 
     bool success = true;
 
-    m_nh_key.weight = weight;
+    m_key.weight = weight;
 
     if (isSynced())
     {
         sai_attribute_t nhgm_attr;
         nhgm_attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_WEIGHT;
-        nhgm_attr.value.s32 = m_nh_key.weight;
+        nhgm_attr.value.s32 = m_key.weight;
 
         sai_status_t status = sai_next_hop_group_api->set_next_hop_group_member_attribute(m_gm_id, &nhgm_attr);
         success = status == SAI_STATUS_SUCCESS;
@@ -472,12 +629,8 @@ void NextHopGroupMember::sync(sai_object_id_t gm_id)
 {
     SWSS_LOG_ENTER();
 
-    /* The SAI ID should be updated from invalid to something valid. */
-    assert((m_gm_id == SAI_NULL_OBJECT_ID) && (gm_id != SAI_NULL_OBJECT_ID));
-
-    m_gm_id = gm_id;
-    gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_NEXTHOP_GROUP_MEMBER);
-    gNeighOrch->increaseNextHopRefCount(m_nh_key);
+    NhgMember::sync(gm_id);
+    gNeighOrch->increaseNextHopRefCount(m_key);
 }
 
 /*
@@ -491,18 +644,8 @@ void NextHopGroupMember::remove()
 {
     SWSS_LOG_ENTER();
 
-    /*
-     * If the member is already removed, exit so we don't decrement the ref
-     * counters more than once.
-     */
-    if (!isSynced())
-    {
-        return;
-    }
-
-    m_gm_id = SAI_NULL_OBJECT_ID;
-    gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_NEXTHOP_GROUP_MEMBER);
-    gNeighOrch->decreaseNextHopRefCount(m_nh_key);
+    NhgMember::remove();
+    gNeighOrch->decreaseNextHopRefCount(m_key);
 }
 
 /*
@@ -516,11 +659,14 @@ NextHopGroupMember::~NextHopGroupMember()
 {
     SWSS_LOG_ENTER();
 
-    /*
-     * The group member should be removed from its group before destroying it.
-     */
-    assert(!isSynced());
-
+    if (m_key.isSrv6NextHop() && gNeighOrch->hasNextHop(m_key) &&
+                !gNeighOrch->getNextHopRefCount(m_key))
+    {
+        if (!gSrv6Orch->removeSrv6NexthopWithoutVpn(m_key))
+        {
+            SWSS_LOG_ERROR("SRv6 Nexthop %s delete failed", m_key.to_string(false, true).c_str());
+        }
+    }
     /*
      * If the labeled next hop is unreferenced, remove it from NeighOrch as
      * NhgOrch and RouteOrch are the ones controlling it's lifetime.  They both
@@ -528,11 +674,11 @@ NextHopGroupMember::~NextHopGroupMember()
      * them as they're both doing the same checks before removing a labeled
      * next hop.
      */
-    if (isLabeled() &&
-        gNeighOrch->hasNextHop(m_nh_key) &&
-        (gNeighOrch->getNextHopRefCount(m_nh_key) == 0))
+    else if (isLabeled() &&
+        gNeighOrch->hasNextHop(m_key) &&
+        (gNeighOrch->getNextHopRefCount(m_key) == 0))
     {
-        gNeighOrch->removeMplsNextHop(m_nh_key);
+        gNeighOrch->removeMplsNextHop(m_key);
     }
 }
 
@@ -542,10 +688,7 @@ NextHopGroupMember::~NextHopGroupMember()
  * Params:      IN  key - The next hop group's key.
  * Returns:     Nothing.
  */
-NextHopGroup::NextHopGroup(const NextHopGroupKey& key, bool is_temp) :
-    m_key(key),
-    m_id(SAI_NULL_OBJECT_ID),
-    m_is_temp(is_temp)
+NextHopGroup::NextHopGroup(const NextHopGroupKey& key, bool is_temp) : NhgCommon(key), m_is_temp(is_temp), m_is_recursive(false)
 {
     SWSS_LOG_ENTER();
 
@@ -554,24 +697,6 @@ NextHopGroup::NextHopGroup(const NextHopGroupKey& key, bool is_temp) :
     {
         m_members.emplace(it, NextHopGroupMember(it));
     }
-}
-
-/*
- * Purpose:     Move constructor.
- * Description: Initialize the members by doing member-wise move construct.
- * Params:      IN  nhg - The rvalue object to initialize from.
- * Returns:     Nothing.
- */
-NextHopGroup::NextHopGroup(NextHopGroup&& nhg) :
-    m_key(std::move(nhg.m_key)),
-    m_id(std::move(nhg.m_id)),
-    m_members(std::move(nhg.m_members)),
-    m_is_temp(nhg.m_is_temp)
-{
-    SWSS_LOG_ENTER();
-
-    /* Invalidate the rvalue SAI ID. */
-    nhg.m_id = SAI_NULL_OBJECT_ID;
 }
 
 /*
@@ -584,10 +709,10 @@ NextHopGroup& NextHopGroup::operator=(NextHopGroup&& nhg)
 {
     SWSS_LOG_ENTER();
 
-    std::swap(m_key, nhg.m_key);
-    std::swap(m_id, nhg.m_id);
-    std::swap(m_members, nhg.m_members);
     m_is_temp = nhg.m_is_temp;
+    m_is_recursive = nhg.m_is_recursive;
+
+    NhgCommon::operator=(std::move(nhg));
 
     return *this;
 }
@@ -612,23 +737,26 @@ bool NextHopGroup::sync()
         return true;
     }
 
-    /*
-     * If the group is temporary, the group ID will be the only member's NH
-     * ID.
-     */
-    if (m_is_temp)
+    /* If the group is non-recursive with single member, the group ID will be the only member's NH ID */
+    if (!isRecursive() && (m_members.size() == 1))
     {
         const NextHopGroupMember& nhgm = m_members.begin()->second;
         sai_object_id_t nhid = nhgm.getNhId();
 
         if (nhid == SAI_NULL_OBJECT_ID)
         {
-            SWSS_LOG_WARN("Next hop %s is not synced", nhgm.getNhKey().to_string().c_str());
+            SWSS_LOG_WARN("Next hop %s is not synced", nhgm.getKey().to_string().c_str());
             return false;
         }
         else
         {
             m_id = nhid;
+
+            auto nh_key = nhgm.getKey();
+            if (nh_key.isIntfNextHop())
+                gIntfsOrch->increaseRouterIntfsRefCount(nh_key.alias);
+            else
+                gNeighOrch->increaseNextHopRefCount(nh_key);
         }
     }
     else
@@ -656,10 +784,10 @@ bool NextHopGroup::sync()
             SWSS_LOG_ERROR("Failed to create next hop group %s, rv:%d",
                             m_key.to_string().c_str(), status);
 
-            task_process_status handle_status = gNhgOrch->handleSaiCreateStatus(SAI_API_NEXT_HOP_GROUP, status);
+            task_process_status handle_status = handleSaiCreateStatus(SAI_API_NEXT_HOP_GROUP, status);
             if (handle_status != task_success)
             {
-                return gNhgOrch->parseHandleSaiStatusFailure(handle_status);
+                return parseHandleSaiStatusFailure(handle_status);
             }
         }
 
@@ -667,7 +795,7 @@ bool NextHopGroup::sync()
         gCrmOrch->incCrmResUsedCounter(CrmResourceType::CRM_NEXTHOP_GROUP);
 
         /* Increment the number of synced NHGs. */
-        ++m_count;
+        ++m_syncdCount;
 
         /*
         * Try creating the next hop group's members over SAI.
@@ -743,47 +871,26 @@ bool NextHopGroup::remove()
 {
     SWSS_LOG_ENTER();
 
-    /*  If the group is already removed, or is temporary, there is nothing to be done -
-     *  just reset the ID.
-     */
-    if (!isSynced() || m_is_temp)
+    if (!isSynced())
     {
+        return true;
+    }
+    //  If the group is temporary or non-recursive, update the neigh or rif ref-count and reset the ID.
+    if (m_is_temp ||
+        (!isRecursive() && m_members.size() == 1))
+    {
+        const NextHopGroupMember& nhgm = m_members.begin()->second;
+        auto nh_key = nhgm.getKey();
+        if (nh_key.isIntfNextHop())
+            gIntfsOrch->decreaseRouterIntfsRefCount(nh_key.alias);
+        else
+            gNeighOrch->decreaseNextHopRefCount(nh_key);
+
         m_id = SAI_NULL_OBJECT_ID;
         return true;
     }
 
-    /* Remove group's members. If we failed to remove the members, exit. */
-    if (!removeMembers(m_key.getNextHops()))
-    {
-        SWSS_LOG_ERROR("Failed to remove group %s members", to_string().c_str());
-        return false;
-    }
-
-    /* Remove the group. */
-    sai_status_t status = sai_next_hop_group_api->
-                                        remove_next_hop_group(m_id);
-
-    if (status != SAI_STATUS_SUCCESS)
-    {
-        SWSS_LOG_ERROR("Failed to remove next hop group %s, rv: %d",
-                        m_key.to_string().c_str(), status);
-
-        task_process_status handle_status = gNhgOrch->handleSaiRemoveStatus(SAI_API_NEXT_HOP_GROUP, status);
-        if (handle_status != task_success)
-        {
-            return gNhgOrch->parseHandleSaiStatusFailure(handle_status);
-        }
-    }
-
-    /* If the operation is successful, release the resources. */
-    gCrmOrch->decCrmResUsedCounter(
-                            CrmResourceType::CRM_NEXTHOP_GROUP);
-    --m_count;
-
-    /* Reset the group ID. */
-    m_id = SAI_NULL_OBJECT_ID;
-
-    return true;
+    return NhgCommon::remove();
 }
 
 /*
@@ -800,6 +907,9 @@ bool NextHopGroup::syncMembers(const std::set<NextHopKey>& nh_keys)
 {
     SWSS_LOG_ENTER();
 
+    /* This method should not be called for single-membered non-recursive nexthop groups */
+    assert(isRecursive() || (m_members.size() > 1));
+
     ObjectBulker<sai_next_hop_group_api_t> nextHopGroupMemberBulker(sai_next_hop_group_api, gSwitchId, gMaxBulkSize);
 
     /*
@@ -811,12 +921,13 @@ bool NextHopGroup::syncMembers(const std::set<NextHopKey>& nh_keys)
      */
     std::map<NextHopKey, sai_object_id_t> syncingMembers;
 
+    bool success = true;
     for (const auto& nh_key : nh_keys)
     {
         NextHopGroupMember& nhgm = m_members.at(nh_key);
 
         /* If the member is already synced, continue. */
-        if (nhgm.getGmId() != SAI_NULL_OBJECT_ID)
+        if (nhgm.isSynced())
         {
             continue;
         }
@@ -828,7 +939,8 @@ bool NextHopGroup::syncMembers(const std::set<NextHopKey>& nh_keys)
         {
             SWSS_LOG_WARN("Failed to get next hop %s in group %s",
                         nhgm.to_string().c_str(), to_string().c_str());
-            return false;
+            success = false;
+            continue;
         }
 
         /* If the neighbor's interface is down, skip from being syncd. */
@@ -855,7 +967,6 @@ bool NextHopGroup::syncMembers(const std::set<NextHopKey>& nh_keys)
      * Go through the synced members and increment the Crm ref count for the
      * successful ones.
      */
-    bool success = true;
     for (const auto& mbr : syncingMembers)
     {
         /* Check that the returned member ID is valid. */
@@ -868,66 +979,6 @@ bool NextHopGroup::syncMembers(const std::set<NextHopKey>& nh_keys)
         else
         {
             m_members.at(mbr.first).sync(mbr.second);
-        }
-    }
-
-    return success;
-}
-/*
- * Purpose:     Remove the given group's members over the SAI API.
- * Description: Go through the given members and remove them.
- * Params:      IN  nh_keys - The next hop keys of the members to remove.
- * Returns:     true, if the operation was successful;
- *              false, otherwise
- */
-bool NextHopGroup::removeMembers(const std::set<NextHopKey>& nh_keys)
-{
-    SWSS_LOG_ENTER();
-
-    ObjectBulker<sai_next_hop_group_api_t> nextHopGroupMemberBulker(
-                                    sai_next_hop_group_api, gSwitchId, gMaxBulkSize);
-
-    /*
-     * Iterate through the given group members add them to be removed.
-     *
-     * Keep track of the SAI remove statuses in case one of them returns an
-     * error.  We assume that removal should always succeed.  If for some
-     * reason it doesn't, there's nothing we can do, but we'll log an error
-     * later.
-     */
-    std::map<NextHopKey, sai_status_t> statuses;
-
-    for (const auto& nh_key : nh_keys)
-    {
-        const NextHopGroupMember& nhgm = m_members.at(nh_key);
-
-        if (nhgm.isSynced())
-        {
-            nextHopGroupMemberBulker.remove_entry(&statuses[nh_key], nhgm.getGmId());
-        }
-    }
-
-    /* Flush the bulker to apply the changes. */
-    nextHopGroupMemberBulker.flush();
-
-    /*
-     * Iterate over the statuses map and check if the removal was successful.
-     * If it was, decrement the Crm counter and reset the member's ID.  If it
-     * wasn't, log an error message.
-     */
-    bool success = true;
-
-    for (const auto& status : statuses)
-    {
-        if (status.second == SAI_STATUS_SUCCESS)
-        {
-            m_members.at(status.first).remove();
-        }
-        else
-        {
-            SWSS_LOG_ERROR("Could not remove next hop group member %s, rv: %d",
-                            status.first.to_string().c_str(), status.second);
-            success = false;
         }
     }
 
@@ -948,6 +999,23 @@ bool NextHopGroup::removeMembers(const std::set<NextHopKey>& nh_keys)
 bool NextHopGroup::update(const NextHopGroupKey& nhg_key)
 {
     SWSS_LOG_ENTER();
+
+    if (!isSynced() ||
+        (!isRecursive() && (m_members.size() == 1 || nhg_key.getSize() == 1)))
+    {
+        bool was_synced = isSynced();
+        bool was_temp = isTemp();
+        *this = NextHopGroup(nhg_key, false);
+
+        /*
+        * For temporary nexthop group being updated, set the recursive flag
+        * as it is expected to get promoted to multiple NHG
+        */
+        setRecursive(was_temp);
+
+        /* Sync the group only if it was synced before. */
+        return (was_synced ? sync() : true);
+    }
 
     /* Update the key. */
     m_key = nhg_key;
@@ -971,7 +1039,7 @@ bool NextHopGroup::update(const NextHopGroupKey& nhg_key)
         /* If the member is updated, update it's weight. */
         else
         {
-            if (!mbr_it.second.updateWeight(new_nh_key_it->weight))
+            if (new_nh_key_it->weight && mbr_it.second.getWeight() != new_nh_key_it->weight && !mbr_it.second.updateWeight(new_nh_key_it->weight))
             {
                 SWSS_LOG_WARN("Failed to update member %s weight", nh_key.to_string().c_str());
                 return false;
@@ -1041,10 +1109,14 @@ vector<sai_attribute_t> NextHopGroup::createNhgmAttrs(const NextHopGroupMember& 
     nhgm_attr.value.oid = nhgm.getNhId();
     nhgm_attrs.push_back(nhgm_attr);
 
-    /* Fill in the wright. */
-    nhgm_attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_WEIGHT;
-    nhgm_attr.value.s32 = nhgm.getWeight();
-    nhgm_attrs.push_back(nhgm_attr);
+    /* Fill in the weight if set. */
+    auto weight  = nhgm.getWeight();
+    if (weight != 0)
+    {
+        nhgm_attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_WEIGHT;
+        nhgm_attr.value.s32 = weight;
+        nhgm_attrs.push_back(nhgm_attr);
+    }
 
     return nhgm_attrs;
 }
@@ -1060,7 +1132,12 @@ bool NextHopGroup::validateNextHop(const NextHopKey& nh_key)
 {
     SWSS_LOG_ENTER();
 
-    return syncMembers({nh_key});
+    if (isRecursive() || (m_members.size() > 1))
+    {
+        return syncMembers({nh_key});
+    }
+
+    return true;
 }
 
 /*
@@ -1074,5 +1151,10 @@ bool NextHopGroup::invalidateNextHop(const NextHopKey& nh_key)
 {
     SWSS_LOG_ENTER();
 
-    return removeMembers({nh_key});
+    if (isRecursive() || (m_members.size() > 1))
+    {
+        return removeMembers({nh_key});
+    }
+
+    return true;
 }

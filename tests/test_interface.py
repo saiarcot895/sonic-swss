@@ -4,6 +4,8 @@ import pytest
 
 from swsscommon import swsscommon
 
+VLAN_SUB_INTERFACE_SEPARATOR = '.'
+
 class TestRouterInterface(object):
     def setup_db(self, dvs):
         self.pdb = swsscommon.DBConnector(0, dvs.redis_sock, 0)
@@ -15,6 +17,8 @@ class TestRouterInterface(object):
             tbl_name = "PORTCHANNEL"
         elif interface.startswith("Vlan"):
             tbl_name = "VLAN"
+        elif interface.startswith("Loopback"):
+            tbl_name = "LOOPBACK_INTERFACE"
         else:
             tbl_name = "PORT"
         tbl = swsscommon.Table(self.cdb, tbl_name)
@@ -1963,6 +1967,72 @@ class TestRouterInterface(object):
             if route["dest"] == "10.0.0.4/32":
                 assert False
 
+    def test_LoopbackInterfaceAdminStatus(self, dvs, testlog):
+        self.setup_db(dvs)
+
+        # Create loopback interfaces
+        self.create_l3_intf("Loopback0", "")
+
+        # add ip address
+        self.add_ip_address("Loopback0", "10.1.0.1/32")
+
+        # Check application database
+        tbl = swsscommon.Table(self.pdb, "INTF_TABLE:Loopback0")
+        intf_entries = tbl.getKeys()
+        assert intf_entries[0] == "10.1.0.1/32"
+
+        # Check ASIC database
+        tbl = swsscommon.Table(self.adb, "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY")
+        for key in tbl.getKeys():
+            route = json.loads(key)
+            if route["dest"] == "10.1.0.1/32":
+                lo0_ip2me_found = True
+
+        assert lo0_ip2me_found
+
+        # check linux kernel, interface should be up by default with no admin_status specified
+        (exitcode, result) = dvs.runcmd(['sh', '-c', "ip link show Loopback0"])
+        assert "UP" in result
+
+        ### Bring interface down and validate
+        self.set_admin_status(dvs, "Loopback0", "down")
+
+        # check linux kernel
+        (exitcode, result) = dvs.runcmd(['sh', '-c', "ip link show Loopback0"])
+        assert "DOWN" in result
+
+        ### Bring interface up and validate
+        self.set_admin_status(dvs, "Loopback0", "up")
+
+        # Check ASIC database
+        tbl = swsscommon.Table(self.adb, "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY")
+        for key in tbl.getKeys():
+            route = json.loads(key)
+            if route["dest"] == "10.1.0.1/32":
+                lo0_ip2me_found = True
+
+        assert lo0_ip2me_found
+
+        # check linux kernel
+        (exitcode, result) = dvs.runcmd(['sh', '-c', "ip link show Loopback0"])
+        assert "UP" in result
+
+        # Cleanup
+        self.remove_ip_address("Loopback0", "10.1.0.1/32")
+        self.remove_l3_intf("Loopback0")
+
+        # Check application database
+        tbl = swsscommon.Table(self.pdb, "INTF_TABLE:Loopback0")
+        intf_entries = tbl.getKeys()
+        assert len(intf_entries) == 0
+
+        # Check ASIC database
+        tbl = swsscommon.Table(self.adb, "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY")
+        for key in tbl.getKeys():
+            route = json.loads(key)
+            if route["dest"] == "10.1.0.1/32":
+                assert False
+
 
     def create_ipv6_link_local(self, interface):
         if interface.startswith("PortChannel"):
@@ -2193,6 +2263,100 @@ class TestRouterInterface(object):
         # one loopback router interface
         assert len(intf_entries) == 1
 
+    def set_loopback_action(self, interface, action):
+        if interface.startswith("PortChannel"):
+            tbl_name = "PORTCHANNEL_INTERFACE"
+        elif interface.startswith("Vlan"):
+            tbl_name = "VLAN_INTERFACE"
+        else:
+            sub_intf_sep_idx = interface.find(VLAN_SUB_INTERFACE_SEPARATOR)
+            if sub_intf_sep_idx != -1:
+                tbl_name = "VLAN_SUB_INTERFACE"
+            else:
+                tbl_name = "INTERFACE"
+
+        fvs = swsscommon.FieldValuePairs([("loopback_action", action)])
+        tbl = swsscommon.Table(self.cdb, tbl_name)
+        tbl.set(interface, fvs)
+        time.sleep(1)
+
+    def loopback_action_test(self, iface, action):
+        # create interface
+        self.create_l3_intf(iface, "")
+
+        # set interface loopback action in config db
+        self.set_loopback_action(iface, action)
+
+        # check application database
+        tbl = swsscommon.Table(self.pdb, "INTF_TABLE")
+        (status, fvs) = tbl.get(iface)
+        assert status == True
+
+        action_found = False
+        for fv in fvs:
+            if fv[0] == "loopback_action":
+                action_found = True
+                assert fv[1] == action
+        assert action_found == True
+
+        # check asic db
+        tbl = swsscommon.Table(self.adb, "ASIC_STATE:SAI_OBJECT_TYPE_ROUTER_INTERFACE")
+        intf_entries = tbl.getKeys()
+
+        action_map = {"drop": "SAI_PACKET_ACTION_DROP", "forward": "SAI_PACKET_ACTION_FORWARD"}
+        action_found = False
+        for key in intf_entries:
+            (status, fvs) = tbl.get(key)
+            assert status == True
+
+            for fv in fvs:
+                if fv[0] == "SAI_ROUTER_INTERFACE_ATTR_LOOPBACK_PACKET_ACTION":
+                    action_found = True
+                    assert fv[1] == action_map[action]
+        assert action_found == True
+
+        # remove interface
+        self.remove_l3_intf(iface)
+
+    def test_interfaceLoopbackActionDrop(self, dvs, testlog):
+        self.setup_db(dvs)
+        self.loopback_action_test("Ethernet8", "drop")
+        
+    def test_interfaceLoopbackActionForward(self, dvs, testlog):
+        self.setup_db(dvs)
+        self.loopback_action_test("Ethernet8", "forward")
+
+    def test_subInterfaceLoopbackActionDrop(self, dvs, testlog):
+        self.setup_db(dvs)
+        self.loopback_action_test("Ethernet8.1", "drop")
+        
+    def test_subInterfaceLoopbackActionForward(self, dvs, testlog):
+        self.setup_db(dvs)
+        self.loopback_action_test("Ethernet8.1", "forward")
+
+    def test_vlanInterfaceLoopbackActionDrop(self, dvs, testlog):
+        self.setup_db(dvs)
+        self.create_vlan("10")
+        self.loopback_action_test("Vlan10", "drop")
+        self.remove_vlan("10")
+        
+    def test_vlanInterfaceLoopbackActionForward(self, dvs, testlog):
+        self.setup_db(dvs)
+        self.create_vlan("20")
+        self.loopback_action_test("Vlan20", "forward")
+        self.remove_vlan("20")
+
+    def test_portChannelInterfaceLoopbackActionDrop(self, dvs, testlog):
+        self.setup_db(dvs)
+        self.create_port_channel("PortChannel009")
+        self.loopback_action_test("PortChannel009", "drop")
+        self.remove_port_channel("PortChannel009")
+        
+    def test_portChannelInterfaceLoopbackActionForward(self, dvs, testlog):
+        self.setup_db(dvs)
+        self.create_port_channel("PortChannel010")
+        self.loopback_action_test("PortChannel010", "forward")
+        self.remove_port_channel("PortChannel010")
 
 # Add Dummy always-pass test at end as workaroud
 # for issue when Flaky fail on final test it invokes module tear-down before retrying

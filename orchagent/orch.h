@@ -7,19 +7,26 @@
 #include <set>
 #include <memory>
 #include <utility>
+#include <condition_variable>
 
 extern "C" {
-#include "sai.h"
-#include "saistatus.h"
+#include <sai.h>
+#include <saistatus.h>
 }
 
 #include "dbconnector.h"
 #include "table.h"
 #include "consumertable.h"
 #include "consumerstatetable.h"
+#include "zmqconsumerstatetable.h"
+#include "zmqserver.h"
 #include "notificationconsumer.h"
 #include "selectabletimer.h"
 #include "macaddress.h"
+#include "response_publisher.h"
+#include "recorder.h"
+#include "schema.h"
+#include "retrycache.h"
 
 const char delimiter           = ':';
 const char list_item_delimiter = ',';
@@ -30,18 +37,24 @@ const char range_specifier     = '-';
 const char config_db_key_delimiter = '|';
 const char state_db_key_delimiter  = '|';
 
-#define INVM_PLATFORM_SUBSTRING "innovium"
+#define MRVL_TL_PLATFORM_SUBSTRING "marvell-teralynx"
+#define MRVL_PRST_PLATFORM_SUBSTRING "marvell-prestera"
 #define MLNX_PLATFORM_SUBSTRING "mellanox"
 #define BRCM_PLATFORM_SUBSTRING "broadcom"
+#define BRCM_DNX_PLATFORM_SUBSTRING "broadcom-dnx"
 #define BFN_PLATFORM_SUBSTRING  "barefoot"
 #define VS_PLATFORM_SUBSTRING   "vs"
 #define NPS_PLATFORM_SUBSTRING  "nephos"
-#define MRVL_PLATFORM_SUBSTRING "marvell"
 #define CISCO_8000_PLATFORM_SUBSTRING "cisco-8000"
+#define XS_PLATFORM_SUBSTRING   "xsight"
+#define CLX_PLATFORM_SUBSTRING  "clounix"
 
 #define CONFIGDB_KEY_SEPARATOR "|"
 #define DEFAULT_KEY_SEPARATOR  ":"
 #define VLAN_SUB_INTERFACE_SEPARATOR "."
+
+#define RING_SIZE 30
+#define SLEEP_MSECONDS 500
 
 const int default_orch_pri = 0;
 
@@ -64,10 +77,11 @@ typedef struct
     // multiple objects being referenced are separated by ','
     std::map<std::string, std::string> m_objsReferencingByMe;
     sai_object_id_t m_saiObjectId;
+    bool m_pendingRemove;
 } referenced_object;
 
 typedef std::map<std::string, referenced_object> object_reference_map;
-typedef std::map<std::string, object_reference_map*> type_map;
+typedef std::map<std::string, std::shared_ptr<object_reference_map>> type_map;
 
 typedef std::map<std::string, sai_object_id_t> object_map;
 typedef std::pair<std::string, sai_object_id_t> object_map_pair;
@@ -80,6 +94,10 @@ typedef std::multimap<std::string, swss::KeyOpFieldsValuesTuple> SyncMap;
 typedef std::pair<std::string, int> table_name_with_pri_t;
 
 class Orch;
+
+using AnyTask = std::function<void()>; // represents a function with no argument and returns void
+
+class RingBuffer;
 
 // Design assumption
 // 1. one Orch can have one or more Executor
@@ -117,6 +135,10 @@ public:
         return m_name;
     }
 
+    Orch *getOrch() const { return m_orch; }
+    static std::shared_ptr<RingBuffer> gRingBuffer;
+    void processAnyTask(AnyTask&& func);
+
 protected:
     swss::Selectable *m_selectable;
     Orch *m_orch;
@@ -128,52 +150,115 @@ protected:
     swss::Selectable *getSelectable() const { return m_selectable; }
 };
 
-class Consumer : public Executor {
+typedef std::map<std::string, std::shared_ptr<Executor>> ConsumerMap;
+
+class ConsumerBase : public Executor {
 public:
-    Consumer(swss::ConsumerTableBase *select, Orch *orch, const std::string &name)
-        : Executor(select, orch, name)
+    ConsumerBase(swss::Selectable *selectable, Orch *orch, const std::string &name)
+        : Executor(selectable, orch, name)
     {
     }
 
-    swss::ConsumerTableBase *getConsumerTable() const
-    {
-        return static_cast<swss::ConsumerTableBase *>(getSelectable());
-    }
+    virtual swss::TableBase *getConsumerTable() const = 0;
 
     std::string getTableName() const
     {
         return getConsumerTable()->getTableName();
     }
 
-    int getDbId() const
-    {
-        return getConsumerTable()->getDbConnector()->getDbId();
-    }
-
-    std::string getDbName() const
-    {
-        return getConsumerTable()->getDbConnector()->getDbName();
-    }
-
     std::string dumpTuple(const swss::KeyOpFieldsValuesTuple &tuple);
     void dumpPendingTasks(std::vector<std::string> &ts);
-
-    size_t refillToSync();
-    size_t refillToSync(swss::Table* table);
-    void execute();
-    void drain();
 
     /* Store the latest 'golden' status */
     // TODO: hide?
     SyncMap m_toSync;
 
-    void addToSync(const swss::KeyOpFieldsValuesTuple &entry);
+    /* record the tuple */
+    void recordTuple(const swss::KeyOpFieldsValuesTuple &tuple);
+
+    void addToSync(const swss::KeyOpFieldsValuesTuple &entry, bool onRetry=false);
 
     // Returns: the number of entries added to m_toSync
-    size_t addToSync(const std::deque<swss::KeyOpFieldsValuesTuple> &entries);
+    size_t addToSync(const std::deque<swss::KeyOpFieldsValuesTuple> &entries, bool onRetry=false);
+    size_t addToSync(std::shared_ptr<std::deque<swss::KeyOpFieldsValuesTuple>> entries, bool onRetry=false); 
+
+    /**
+     * @brief Add the failed task and its constraint to the consumer's RetryCache
+     * @param task - the task that has failed due to the unmet constraint
+     * @param cst - the unmet constraint that blocks the task from being retried
+     */
+    bool addToRetry(const Task &task, const Constraint &cst);
+
+    size_t refillToSync();
+    size_t refillToSync(swss::Table* table);
 };
 
-typedef std::map<std::string, std::shared_ptr<Executor>> ConsumerMap;
+class RingBuffer
+{
+private:
+    std::vector<AnyTask> buffer;
+    int head = 0;
+    int tail = 0;
+    std::set<std::string> m_consumerSet;
+
+    std::condition_variable cv;
+    std::mutex mtx;
+    bool idle_status = true;
+
+public:
+    RingBuffer(int size=RING_SIZE);
+    bool thread_created = false;
+    std::atomic<bool> thread_exited{false};
+
+    // pause the ring thread if the buffer is empty
+    void pauseThread();
+    // wake up the ring thread in case it's locked but not empty
+    void notify();
+
+    bool IsFull() const;
+    bool IsEmpty() const;
+    bool IsIdle() const;
+
+    bool push(AnyTask entry);
+    bool pop(AnyTask& entry);
+
+    void addExecutor(Executor* executor);
+    bool serves(const std::string& tableName);
+    void setIdle(bool idle);
+};
+
+class Consumer : public ConsumerBase {
+public:
+    Consumer(swss::ConsumerTableBase *select, Orch *orch, const std::string &name)
+        : ConsumerBase(select, orch, name)
+    {
+    }
+
+    swss::ConsumerTableBase *getConsumerTable() const override
+    {
+        // ConsumerTableBase is a subclass of TableBase
+        return static_cast<swss::ConsumerTableBase *>(getSelectable());
+    }
+
+    const swss::DBConnector* getDbConnector() const
+    {
+        auto table = static_cast<swss::ConsumerTableBase *>(getSelectable());
+        return table->getDbConnector();
+    }
+
+    int getDbId() const
+    {
+        return getDbConnector()->getDbId();
+    }
+
+    std::string getDbName() const
+    {
+        return getDbConnector()->getDbName();
+    }
+
+    void execute() override;
+    void drain() override;
+};
 
 typedef enum
 {
@@ -187,15 +272,21 @@ typedef enum
 
 typedef std::pair<swss::DBConnector *, std::string> TableConnector;
 typedef std::pair<swss::DBConnector *, std::vector<std::string>> TablesConnector;
+#define CACHE "| ++++ |"
+#define DECACHE "| ---- |"
 
 class Orch
 {
 public:
     Orch(swss::DBConnector *db, const std::string tableName, int pri = default_orch_pri);
     Orch(swss::DBConnector *db, const std::vector<std::string> &tableNames);
+    Orch(swss::DBConnector *db1, swss::DBConnector *db2,
+        const std::vector<std::string> &tableNames_1, const std::vector<std::string> &tableNames_2);
     Orch(swss::DBConnector *db, const std::vector<table_name_with_pri_t> &tableNameWithPri);
     Orch(const std::vector<TableConnector>& tables);
-    virtual ~Orch();
+    virtual ~Orch() = default;
+
+    static std::shared_ptr<RingBuffer> gRingBuffer;
 
     std::vector<swss::Selectable*> getSelectables();
 
@@ -211,40 +302,81 @@ public:
     virtual void doTask();
 
     /* Run doTask against a specific executor */
-    virtual void doTask(Consumer &consumer) = 0;
+    virtual void doTask(Consumer &consumer) { };
     virtual void doTask(swss::NotificationConsumer &consumer) { }
     virtual void doTask(swss::SelectableTimer &timer) { }
 
-    /* TODO: refactor recording */
-    static void recordTuple(Consumer &consumer, const swss::KeyOpFieldsValuesTuple &tuple);
+    /*
+     * Called once after APPLY_VIEW in warm/fast boot scenario.
+     * Orch can override this method to perform orch specific operations after boot is finished.
+     * These operations are not meant to produce additional ASIC configuration,
+     * instead a capability fetch and STATE_DB update here is encouraged.
+     * Orch is not expected to call the base method implementation as it must remain
+     * empty for compatibility reasons.
+     */
+    virtual void onWarmBootEnd() { }
 
     void dumpPendingTasks(std::vector<std::string> &ts);
+    
+    void createRetryCache(const std::string &executorName);
+    RetryCache* getRetryCache(const std::string &executorName);
+    ConsumerBase* getConsumerBase(const std::string &executorName);
+
+    /** 
+     * @brief Add the failed task and its constraint to the consumer's RetryCache
+     * @param executorName - name of the consumer
+     * @param task - the task that has failed due to the unmet constraint
+     * @param cst - the unmet constraint that blocks the task from being retried
+     * @return true only if the consumer has initialized a retry cache and the task is successfully added into it
+     */
+    bool addToRetry(const std::string &executorName, const Task &task, const Constraint &cst);
+
+    /** 
+     * @brief Check the consumer's RetryCache for pending tasks with constraints already resolved.
+     * If any, move them from RetryMap back to SyncMap, such that they can be retried when the consumer's execute() method is invoked.
+     * Make sure to limit the number of tasks added to SyncMap in one call, to avoid starvation of new tasks in SyncMap.
+     * @param executorName - name of the consumer
+     * @param quota - maximum number of tasks to be moved back to SyncMap in a single call
+     */
+    virtual size_t retryToSync(const std::string &executorName, size_t quota=30000);
+
+    /** 
+     * @brief Notify the consumer that the constraint is already resolved
+     * @param retryOrch - the consumer's Orch instance, used to get the consumer's RetryCache
+     * @param executorName - name of the consumer to be notified
+     * @param cst - the constraint that is resolved
+     */
+    virtual void notifyRetry(Orch *retryOrch, const std::string &executorName, const Constraint &cst);
+
+    /**
+     * @brief Flush pending responses
+     */
+    void flushResponses();
 protected:
     ConsumerMap m_consumerMap;
+    RetryCacheMap m_retryCaches;
 
-    static void logfileReopen();
-    std::string dumpTuple(Consumer &consumer, const swss::KeyOpFieldsValuesTuple &tuple);
+    Orch();
     ref_resolve_status resolveFieldRefValue(type_map&, const std::string&, const std::string&, swss::KeyOpFieldsValuesTuple&, sai_object_id_t&, std::string&);
+    std::set<std::string> generateIdListFromMap(unsigned long idsMap, sai_uint32_t maxId);
+    unsigned long generateBitMapFromIdsStr(const std::string &idsStr);
+    bool isItemIdsMapContinuous(unsigned long idsMap, sai_uint32_t maxId);
     bool parseIndexRange(const std::string &input, sai_uint32_t &range_low, sai_uint32_t &range_high);
     bool parseReference(type_map &type_maps, std::string &ref, const std::string &table_name, std::string &object_name);
     ref_resolve_status resolveFieldRefArray(type_map&, const std::string&, const std::string&, swss::KeyOpFieldsValuesTuple&, std::vector<sai_object_id_t>&, std::string&);
     void setObjectReference(type_map&, const std::string&, const std::string&, const std::string&, const std::string&);
+    bool doesObjectExist(type_map&, const std::string&, const std::string&, const std::string&, std::string&);
     void removeObject(type_map&, const std::string&, const std::string&);
     bool isObjectBeingReferenced(type_map&, const std::string&, const std::string&);
     std::string objectReferenceInfo(type_map&, const std::string&, const std::string&);
+    void removeMeFromObjsReferencedByMe(type_map &type_maps, const std::string &table, const std::string &obj_name, const std::string &field, const std::string &old_referenced_obj_name, bool remove_field=true);
 
     /* Note: consumer will be owned by this class */
     void addExecutor(Executor* executor);
     Executor *getExecutor(std::string executorName);
 
-    /* Handling SAI status*/
-    virtual task_process_status handleSaiCreateStatus(sai_api_t api, sai_status_t status, void *context = nullptr);
-    virtual task_process_status handleSaiSetStatus(sai_api_t api, sai_status_t status, void *context = nullptr);
-    virtual task_process_status handleSaiRemoveStatus(sai_api_t api, sai_status_t status, void *context = nullptr);
-    virtual task_process_status handleSaiGetStatus(sai_api_t api, sai_status_t status, void *context = nullptr);
-    bool parseHandleSaiStatusFailure(task_process_status status);
+    ResponsePublisher m_publisher{"APPL_STATE_DB"};
 private:
-    void removeMeFromObjsReferencedByMe(type_map &type_maps, const std::string &table, const std::string &obj_name, const std::string &field, const std::string &old_referenced_obj_name);
     void addConsumer(swss::DBConnector *db, std::string tableName, int pri = default_orch_pri);
 };
 

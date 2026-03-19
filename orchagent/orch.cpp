@@ -1,6 +1,5 @@
-#include <fstream>
-#include <iostream>
 #include <inttypes.h>
+#include <stdexcept>
 #include <sys/time.h>
 #include "timestamp.h"
 #include "orch.h"
@@ -10,16 +9,86 @@
 #include "tokenize.h"
 #include "logger.h"
 #include "consumerstatetable.h"
+#include "zmqserver.h"
+#include "zmqconsumerstatetable.h"
 #include "sai_serialize.h"
 
 using namespace swss;
 
-extern int gBatchSize;
+int gBatchSize = 0;
 
-extern bool gSwssRecord;
-extern ofstream gRecordOfs;
-extern bool gLogRotate;
-extern string gRecordFile;
+std::shared_ptr<RingBuffer> Orch::gRingBuffer = nullptr;
+std::shared_ptr<RingBuffer> Executor::gRingBuffer = nullptr;
+
+RingBuffer::RingBuffer(int size): buffer(size)
+{
+    if (size <= 1) {
+        throw std::invalid_argument("Buffer size must be greater than 1");
+    }
+}
+
+void RingBuffer::pauseThread()
+{
+    std::unique_lock<std::mutex> lock(mtx);
+    cv.wait(lock, [&](){ return !IsEmpty() || thread_exited; });
+}
+
+void RingBuffer::notify()
+{
+    // buffer not empty but rthread idle
+    bool task_pending = !IsEmpty() && IsIdle();
+
+    if (thread_exited || task_pending)
+        cv.notify_all();
+}
+
+void RingBuffer::setIdle(bool idle)
+{
+    idle_status = idle;
+}
+
+bool RingBuffer::IsIdle() const
+{
+    return idle_status;
+}
+
+bool RingBuffer::IsFull() const
+{
+    return (tail + 1) % static_cast<int>(buffer.size()) == head;
+}
+
+bool RingBuffer::IsEmpty() const
+{
+    return tail == head;
+}
+
+bool RingBuffer::push(AnyTask ringEntry)
+{
+    if (IsFull())
+        return false;
+    buffer[tail] = std::move(ringEntry);
+    tail = (tail + 1) % static_cast<int>(buffer.size());
+    return true;
+}
+
+bool RingBuffer::pop(AnyTask& ringEntry)
+{
+    if (IsEmpty())
+        return false;
+    ringEntry = std::move(buffer[head]);
+    head = (head + 1) % static_cast<int>(buffer.size());
+    return true;
+}
+
+void RingBuffer::addExecutor(Executor* executor)
+{
+    m_consumerSet.insert(executor->getName());
+}
+
+bool RingBuffer::serves(const std::string& tableName)
+{
+    return m_consumerSet.find(tableName) != m_consumerSet.end();  
+}
 
 Orch::Orch(DBConnector *db, const string tableName, int pri)
 {
@@ -31,6 +100,20 @@ Orch::Orch(DBConnector *db, const vector<string> &tableNames)
     for (auto it : tableNames)
     {
         addConsumer(db, it, default_orch_pri);
+    }
+}
+
+Orch::Orch(swss::DBConnector *db1, swss::DBConnector *db2, 
+    const std::vector<std::string> &tableNames_1, const std::vector<std::string> &tableNames_2)
+{
+    for(auto it : tableNames_1)
+    {
+        addConsumer(db1, it, default_orch_pri);
+    }
+
+    for(auto it : tableNames_2)
+    {
+        addConsumer(db2, it, default_orch_pri);
     }
 }
 
@@ -50,12 +133,8 @@ Orch::Orch(const vector<TableConnector>& tables)
     }
 }
 
-Orch::~Orch()
+Orch::Orch()
 {
-    if (gRecordOfs.is_open())
-    {
-        gRecordOfs.close();
-    }
 }
 
 vector<Selectable *> Orch::getSelectables()
@@ -68,18 +147,176 @@ vector<Selectable *> Orch::getSelectables()
     return selectables;
 }
 
-void Consumer::addToSync(const KeyOpFieldsValuesTuple &entry)
+void Orch::createRetryCache(const std::string &executorName) {
+    if (m_retryCaches.find(executorName) == m_retryCaches.end())
+        m_retryCaches[executorName] = std::make_shared<RetryCache>(executorName);
+}
+
+RetryCache *Orch::getRetryCache(const std::string &executorName)
+{
+    if (m_retryCaches.find(executorName) == m_retryCaches.end())
+        return nullptr;
+    else
+        return m_retryCaches[executorName].get();
+}
+
+ConsumerBase* Orch::getConsumerBase(const std::string &executorName)
+{
+    if (m_consumerMap.find(executorName) == m_consumerMap.end())
+        return nullptr;
+    return dynamic_cast<ConsumerBase*>(m_consumerMap[executorName].get());
+}
+
+bool ConsumerBase::addToRetry(const Task &task, const Constraint &cst) {
+    auto retryCache = getOrch() ? getOrch()->getRetryCache(getName()) : nullptr;
+    if (retryCache)
+    {
+        Recorder::Instance().retry.record(dumpTuple(task).append(CACHE));
+        retryCache->insert(task, cst);
+        return true;
+    }
+    return false;
+}
+
+bool Orch::addToRetry(const std::string &executorName, const Task &task, const Constraint &cst) {
+    auto retryCache = getRetryCache(executorName);
+    if (retryCache)
+    {
+        Recorder::Instance().retry.record(getConsumerBase(executorName)->dumpTuple(task).append(CACHE));
+        retryCache->insert(task, cst);
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Check the consumer's RetryCache, if the set of resolved constraints is not empty,
+ * query RetryMap for failed tasks indexed by these resolved constraints,
+ * and move them back to the consumer's SyncMap, such that they can be retried in the next iteration.
+ * @param executorName - name of the consumer
+ * @param quota - maximum number of tasks to be moved back to SyncMap in a single call
+ * @return number of tasks moved back to SyncMap
+ */
+size_t Orch::retryToSync(const std::string &executorName, size_t quota)
+{
+    auto retryCache = getRetryCache(executorName);
+
+    // directly return 0 if no retry cache for this executor or quota is non-positive
+    if (!retryCache || quota <= 0)
+        return 0;
+
+    std::unordered_set<Constraint>& constraints = retryCache->getResolvedConstraints();
+
+    size_t count = 0;
+
+    while (!constraints.empty() && count < quota)
+    {
+        auto cst = *constraints.begin();
+
+        auto tasks = retryCache->resolve(cst, quota - count);
+
+        count += tasks->size();
+
+        getConsumerBase(executorName)->addToSync(tasks, true);
+
+    }
+    return count;
+}
+
+void Orch::notifyRetry(Orch *retryOrch, const std::string &executorName, const Constraint &cst)
+{
+    auto retryCache = retryOrch->getRetryCache(executorName);
+    if (!retryCache)
+    {
+        SWSS_LOG_ERROR("RetryCache not initialized for %s", executorName.c_str());
+    }
+    else
+    {
+        retryCache->mark_resolved(cst);
+    }
+}
+
+size_t ConsumerBase::addToSync(std::shared_ptr<std::deque<swss::KeyOpFieldsValuesTuple>> entries, bool onRetry) {
+    return addToSync(*entries, onRetry);
+}
+
+void ConsumerBase::addToSync(const KeyOpFieldsValuesTuple &entry, bool onRetry)
 {
     SWSS_LOG_ENTER();
-
 
     string key = kfvKey(entry);
     string op  = kfvOp(entry);
 
-    /* Record incoming tasks */
-    if (gSwssRecord)
+    if (!onRetry)
+        /* Record incoming tasks */
+        Recorder::Instance().swss.record(dumpTuple(entry));
+    else
+        Recorder::Instance().retry.record(dumpTuple(entry).append(DECACHE));
+
+    auto retryCache = getOrch() ? getOrch()->getRetryCache(getName()) : nullptr;
+
+    if (retryCache && !onRetry)
     {
-        Orch::recordTuple(*this, entry);
+        size_t count = retryCache->getRetryMap().count(key);
+
+        switch (count)
+        {
+        case 0:
+            // No task with the same key found in the retrycache
+            break;
+
+        case 1:
+        {
+            // Single task found
+            auto it = retryCache->getRetryMap().find(key);
+            if (it->second.second == entry) // skip duplicate task
+            {
+                SWSS_LOG_DEBUG("Skip, already in retry cache: %s", dumpTuple(entry).c_str());
+                return;
+            }
+
+            if (op == DEL_COMMAND)
+            {
+                if (kfvOp(it->second.second) == SET_COMMAND)
+                {
+                    auto old_task = retryCache->evict(key);
+                    Recorder::Instance().retry.record(dumpTuple(*old_task).append(DECACHE));
+                }
+            }
+            else if (op == SET_COMMAND)
+            {
+                if (kfvOp(it->second.second) == SET_COMMAND)
+                {
+                    // move the old SET back to m_toSync for later merge
+                    auto old_task = retryCache->evict(key);
+                    m_toSync.emplace(key, *old_task);
+                    Recorder::Instance().retry.record(dumpTuple(*old_task).append(DECACHE));
+                }
+            }
+            break;
+        }
+        case 2:
+        {
+            // 2 tasks found, must be a DEL + a SET
+            if (op == DEL_COMMAND)
+            {
+                // remove the SET task from the cache, reuse the DEL task
+                auto old_task = retryCache->evict(key);
+                Recorder::Instance().retry.record(dumpTuple(*old_task).append(DECACHE));
+                return;
+            }
+            else if (op == SET_COMMAND)
+            {
+                // Keep the DEL task, move the old SET back to m_toSync for later merge
+                auto old_task = retryCache->evict(key);
+                Recorder::Instance().retry.record(dumpTuple(*old_task).append(DECACHE));
+                m_toSync.emplace(key, *old_task);
+            }
+            break;
+        }
+        default:
+            SWSS_LOG_ERROR("Maximum two values per key, found: %zu", count);
+        }
     }
 
     /*
@@ -155,20 +392,20 @@ void Consumer::addToSync(const KeyOpFieldsValuesTuple &entry)
 
 }
 
-size_t Consumer::addToSync(const std::deque<KeyOpFieldsValuesTuple> &entries)
+size_t ConsumerBase::addToSync(const std::deque<KeyOpFieldsValuesTuple> &entries, bool onRetry)
 {
     SWSS_LOG_ENTER();
 
     for (auto& entry: entries)
     {
-        addToSync(entry);
+        addToSync(entry, onRetry);
     }
 
     return entries.size();
 }
 
 // TODO: Table should be const
-size_t Consumer::refillToSync(Table* table)
+size_t ConsumerBase::refillToSync(Table* table)
 {
     std::deque<KeyOpFieldsValuesTuple> entries;
     vector<string> keys;
@@ -190,46 +427,42 @@ size_t Consumer::refillToSync(Table* table)
     return addToSync(entries);
 }
 
-size_t Consumer::refillToSync()
+size_t ConsumerBase::refillToSync()
 {
-    ConsumerTableBase *consumerTable = getConsumerTable();
-
-    auto subTable = dynamic_cast<SubscriberStateTable *>(consumerTable);
+    auto subTable = dynamic_cast<SubscriberStateTable *>(getSelectable());
     if (subTable != NULL)
     {
-        std::deque<KeyOpFieldsValuesTuple> entries;
-        subTable->pops(entries);
-        return addToSync(entries);
+        size_t update_size = 0;
+        size_t total_size = 0;
+        do
+        {
+            std::deque<KeyOpFieldsValuesTuple> entries;
+            subTable->pops(entries);
+            update_size = addToSync(entries);
+            total_size += update_size;
+        } while (update_size != 0);
+        return total_size;
     }
-    else
+    string tableName = getTableName();
+    auto consumerTable = dynamic_cast<ConsumerTableBase *>(getSelectable());
+    if (consumerTable != NULL)
     {
         // consumerTable is either ConsumerStateTable or ConsumerTable
         auto db = consumerTable->getDbConnector();
-        string tableName = consumerTable->getTableName();
         auto table = Table(db, tableName);
         return refillToSync(&table);
     }
+    auto zmqTable = dynamic_cast<ZmqConsumerStateTable *>(getSelectable());
+    if (zmqTable != NULL)
+    {
+        auto db = zmqTable->getDbConnector();
+        auto table = Table(db, tableName);
+        return refillToSync(&table);
+    }
+    return 0;
 }
 
-void Consumer::execute()
-{
-    SWSS_LOG_ENTER();
-
-    std::deque<KeyOpFieldsValuesTuple> entries;
-    getConsumerTable()->pops(entries);
-
-    addToSync(entries);
-
-    drain();
-}
-
-void Consumer::drain()
-{
-    if (!m_toSync.empty())
-        m_orch->doTask(*this);
-}
-
-string Consumer::dumpTuple(const KeyOpFieldsValuesTuple &tuple)
+string ConsumerBase::dumpTuple(const KeyOpFieldsValuesTuple &tuple)
 {
     string s = getTableName() + getConsumerTable()->getTableNameSeparator() + kfvKey(tuple)
                + "|" + kfvOp(tuple);
@@ -241,7 +474,7 @@ string Consumer::dumpTuple(const KeyOpFieldsValuesTuple &tuple)
     return s;
 }
 
-void Consumer::dumpPendingTasks(vector<string> &ts)
+void ConsumerBase::dumpPendingTasks(vector<string> &ts)
 {
     for (auto &tm : m_toSync)
     {
@@ -251,11 +484,84 @@ void Consumer::dumpPendingTasks(vector<string> &ts)
 
         ts.push_back(s);
     }
+
+    // check pending tasks in m_toRetry if orch has allocated a retry cache for this consumer
+    auto rc = getOrch() ? getOrch()->getRetryCache(getTableName()) : nullptr;
+    if (rc)
+    {
+        for (auto &tm : rc->getRetryMap())
+        {
+            KeyOpFieldsValuesTuple& tuple = tm.second.second;
+
+            string s = dumpTuple(tuple);
+
+            ts.push_back(s);
+        }
+    }
+}
+
+void Consumer::execute()
+{
+    SWSS_LOG_ENTER();
+
+    auto entries = std::make_shared<std::deque<KeyOpFieldsValuesTuple>>();
+    getConsumerTable()->pops(*entries);
+
+    processAnyTask(
+        // bundle tasks into a lambda function which takes no argument and returns void
+        // this lambda captures variables by value from the surrounding scope
+        [=](){
+            addToSync(entries);
+            drain();
+        }
+    );
+}
+
+void Executor::processAnyTask(AnyTask&& task)
+{
+    // if either gRingBuffer isn't initialized or the ring thread isn't created
+    if (!gRingBuffer || !gRingBuffer->thread_created) 
+    {
+        // execute the input task immediately
+        task();
+    }
+
+    // Ring Buffer Logic
+
+    // if this executor isn't served by ring buffer
+    else if (!gRingBuffer->serves(getName()))
+    {
+        // this executor should execute the input task in the main thread
+        // but to avoid thread issue, it should wait when the ring buffer is actively working
+        while (!gRingBuffer->IsEmpty() || !gRingBuffer->IsIdle()) {
+            gRingBuffer->notify();
+            std::this_thread::sleep_for(std::chrono::milliseconds(SLEEP_MSECONDS));
+        }
+        // execute task()
+        task();
+    }
+    else
+    {
+        // if this executor is served by ring buffer, 
+        // push the task to gRingBuffer
+        // this task would be executed in the ring thread, not here
+        while (!gRingBuffer->push(task)) {
+            gRingBuffer->notify();
+            SWSS_LOG_WARN("ring is full...push again");
+        }
+        gRingBuffer->notify();
+    }
+}
+
+void Consumer::drain()
+{
+    if (!m_toSync.empty())
+        ((Orch *)m_orch)->doTask((Consumer&)*this);
 }
 
 size_t Orch::addExistingData(const string& tableName)
 {
-    auto consumer = dynamic_cast<Consumer *>(getExecutor(tableName));
+    auto consumer = dynamic_cast<ConsumerBase *>(getExecutor(tableName));
     if (consumer == NULL)
     {
         SWSS_LOG_ERROR("No consumer %s in Orch", tableName.c_str());
@@ -269,7 +575,7 @@ size_t Orch::addExistingData(const string& tableName)
 size_t Orch::addExistingData(Table *table)
 {
     string tableName = table->getTableName();
-    Consumer* consumer = dynamic_cast<Consumer *>(getExecutor(tableName));
+    ConsumerBase* consumer = dynamic_cast<ConsumerBase *>(getExecutor(tableName));
     if (consumer == NULL)
     {
         SWSS_LOG_ERROR("No consumer %s in Orch", tableName.c_str());
@@ -287,7 +593,7 @@ bool Orch::bake()
     {
         string executorName = it.first;
         auto executor = it.second;
-        auto consumer = dynamic_cast<Consumer *>(executor.get());
+        auto consumer = dynamic_cast<ConsumerBase *>(executor.get());
         if (consumer == NULL)
         {
             continue;
@@ -345,6 +651,11 @@ bool Orch::parseReference(type_map &type_maps, string &ref_in, const string &typ
         SWSS_LOG_INFO("map:%s does not contain object with name:%s\n", type_name.c_str(), ref_in.c_str());
         return false;
     }
+    if (obj_it->second.m_pendingRemove)
+    {
+        SWSS_LOG_NOTICE("map:%s contains a pending removed object %s, skip\n", type_name.c_str(), ref_in.c_str());
+        return false;
+    }
     object_name = ref_in;
     SWSS_LOG_DEBUG("parsed: type_name:%s, object_name:%s", type_name.c_str(), object_name.c_str());
     return true;
@@ -376,7 +687,7 @@ ref_resolve_status Orch::resolveFieldRefValue(
             {
                 return ref_resolve_status::not_resolved;
             }
-            else if (ref_type_name.empty() && object_name.empty())
+            else if (object_name.empty())
             {
                 return ref_resolve_status::empty;
             }
@@ -398,7 +709,8 @@ void Orch::removeMeFromObjsReferencedByMe(
     const string &table,
     const string &obj_name,
     const string &field,
-    const string &old_referenced_obj_name)
+    const string &old_referenced_obj_name,
+    bool remove_field)
 {
     vector<string> objects = tokenize(old_referenced_obj_name, list_item_delimiter);
     for (auto &obj : objects)
@@ -414,6 +726,12 @@ void Orch::removeMeFromObjsReferencedByMe(
                       referenced_table.c_str(), ref_obj_name.c_str(),
                       to_string(old_referenced_obj.m_objsDependingOnMe.size()).c_str());
     }
+
+    if (remove_field)
+    {
+        auto &referencing_object = (*type_maps[table])[obj_name];
+        referencing_object.m_objsReferencingByMe.erase(field);
+    }
 }
 
 void Orch::setObjectReference(
@@ -427,7 +745,7 @@ void Orch::setObjectReference(
     auto field_ref = obj.m_objsReferencingByMe.find(field);
 
     if (field_ref != obj.m_objsReferencingByMe.end())
-        removeMeFromObjsReferencedByMe(type_maps, table, obj_name, field, field_ref->second);
+        removeMeFromObjsReferencedByMe(type_maps, table, obj_name, field, field_ref->second, false);
 
     obj.m_objsReferencingByMe[field] = referenced_obj;
 
@@ -447,16 +765,44 @@ void Orch::setObjectReference(
     }
 }
 
+bool Orch::doesObjectExist(
+    type_map &type_maps,
+    const string &table,
+    const string &obj_name,
+    const string &field,
+    string &referenced_obj)
+{
+    auto &&searchRef = (*type_maps[table]).find(obj_name);
+    if (searchRef != (*type_maps[table]).end())
+    {
+        auto &obj = searchRef->second;
+        auto &&searchReferencingObjectRef = obj.m_objsReferencingByMe.find(field);
+        if (searchReferencingObjectRef != obj.m_objsReferencingByMe.end())
+        {
+            referenced_obj = searchReferencingObjectRef->second;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void Orch::removeObject(
     type_map &type_maps,
     const string &table,
     const string &obj_name)
 {
-    auto &obj = (*type_maps[table])[obj_name];
+    auto &&searchRef = (*type_maps[table]).find(obj_name);
+    if (searchRef == (*type_maps[table]).end())
+    {
+        return;
+    }
+
+    auto &obj = searchRef->second;
 
     for (auto field_ref : obj.m_objsReferencingByMe)
     {
-        removeMeFromObjsReferencedByMe(type_maps, table, obj_name, field_ref.first, field_ref.second);
+        removeMeFromObjsReferencedByMe(type_maps, table, obj_name, field_ref.first, field_ref.second, false);
     }
 
     // Update the field store
@@ -489,8 +835,15 @@ string Orch::objectReferenceInfo(
 
 void Orch::doTask()
 {
+    // limit the number of tasks moved from RetryMap to SyncMap in one iteration 
+    // to avoid starvation of new tasks in SyncMap
+    auto threshold = gBatchSize == 0 ? 30000 : gBatchSize;
+
+    size_t count = 0;
+
     for (auto &it : m_consumerMap)
     {
+        count += retryToSync(it.first, threshold - count);
         it.second->drain();
     }
 }
@@ -499,7 +852,7 @@ void Orch::dumpPendingTasks(vector<string> &ts)
 {
     for (auto &it : m_consumerMap)
     {
-        Consumer* consumer = dynamic_cast<Consumer *>(it.second.get());
+        ConsumerBase* consumer = dynamic_cast<ConsumerBase *>(it.second.get());
         if (consumer == NULL)
         {
             SWSS_LOG_DEBUG("Executor is not a Consumer");
@@ -510,43 +863,9 @@ void Orch::dumpPendingTasks(vector<string> &ts)
     }
 }
 
-void Orch::logfileReopen()
+void Orch::flushResponses()
 {
-    gRecordOfs.close();
-
-    /*
-     * On log rotate we will use the same file name, we are assuming that
-     * logrotate daemon move filename to filename.1 and we will create new
-     * empty file here.
-     */
-
-    gRecordOfs.open(gRecordFile, std::ofstream::out | std::ofstream::app);
-
-    if (!gRecordOfs.is_open())
-    {
-        SWSS_LOG_ERROR("failed to open gRecordOfs file %s: %s", gRecordFile.c_str(), strerror(errno));
-        return;
-    }
-}
-
-void Orch::recordTuple(Consumer &consumer, const KeyOpFieldsValuesTuple &tuple)
-{
-    string s = consumer.dumpTuple(tuple);
-
-    gRecordOfs << getTimestamp() << "|" << s << endl;
-
-    if (gLogRotate)
-    {
-        gLogRotate = false;
-
-        logfileReopen();
-    }
-}
-
-string Orch::dumpTuple(Consumer &consumer, const KeyOpFieldsValuesTuple &tuple)
-{
-    string s = consumer.dumpTuple(tuple);
-    return s;
+    m_publisher.flush();
 }
 
 ref_resolve_status Orch::resolveFieldRefArray(
@@ -585,7 +904,7 @@ ref_resolve_status Orch::resolveFieldRefArray(
             {
                 if (!parseReference(type_maps, list_items[ind], ref_type_name, object_name))
                 {
-                    SWSS_LOG_ERROR("Failed to parse profile reference:%s\n", list_items[ind].c_str());
+                    SWSS_LOG_NOTICE("Failed to parse profile reference:%s\n", list_items[ind].c_str());
                     return ref_resolve_status::not_resolved;
                 }
                 sai_object_id_t sai_obj = (*(type_maps[ref_type_name]))[object_name].m_saiObjectId;
@@ -635,6 +954,139 @@ bool Orch::parseIndexRange(const string &input, sai_uint32_t &range_low, sai_uin
     return true;
 }
 
+/*
+ * generateBitMapFromIdsStr
+ *
+ * Generates the bit map representing the idsMap in string
+ * Args:
+ *      idsStr: The string representing the IDs.
+ *              Typically it's part of a key of BUFFER_QUEUE or BUFFER_PG, like "3-4" from "Ethernet0|3-4"
+ * Return:
+ *      idsMap: The bitmap of IDs. The LSB stands for ID 0.
+ *
+ * Example:
+ *      Input idsMap: 3-4
+ *      Return: 00011000b
+ */
+unsigned long Orch::generateBitMapFromIdsStr(const string &idsStr)
+{
+    sai_uint32_t lowerBound, upperBound;
+    unsigned long idsMap = 0;
+
+    if (!parseIndexRange(idsStr, lowerBound, upperBound))
+        return 0;
+
+    for (sai_uint32_t id = lowerBound; id <= upperBound; id ++)
+    {
+        idsMap |= (1 << id);
+    }
+
+    return idsMap;
+}
+
+/*
+ * generateIdListFromMap
+ *
+ * Parse the idsMap and generate a vector which contains slices representing bits in idsMap
+ * Args:
+ *     idsMap: The bitmap of IDs. The LSB stands for ID 0.
+ *     maxId: The (exclusive) upperbound of ID range.
+ *            Eg: if ID range is 0~7, maxId should be 8.
+ * Return:
+ *     A vector which contains slices representing bits in idsMap
+ *
+ * Example:
+ *     Input idsMap: 00100110b, maxId: 8
+ *     Return vector: ["1-2", "5"]
+ */
+set<string> Orch::generateIdListFromMap(unsigned long idsMap, sai_uint32_t maxId)
+{
+    unsigned long currentIdMask = 1;
+    bool started = false, needGenerateMap = false;
+    sai_uint32_t lower = 0, upper = 0;
+    set<string> idStringList;
+    for (sai_uint32_t id = 0; id <= maxId; id ++)
+    {
+        // currentIdMask represents the bit mask corresponding to id: (1<<id)
+        if (idsMap & currentIdMask)
+        {
+            if (!started)
+            {
+                started = true;
+                lower = id;
+            }
+        }
+        else
+        {
+            if (started)
+            {
+                started = false;
+                upper = id - 1;
+                needGenerateMap = true;
+            }
+        }
+
+        if (needGenerateMap)
+        {
+            if (lower != upper)
+            {
+                idStringList.insert(to_string(lower) + "-" + to_string(upper));
+            }
+            else
+            {
+                idStringList.insert(to_string(lower));
+            }
+            needGenerateMap = false;
+        }
+
+        currentIdMask <<= 1;
+    }
+
+    return idStringList;
+}
+
+
+/*
+ * isItemIdsMapContinuous
+ *
+ * Check whether the input idsMap is continuous.
+ * An idsMap is continuous means there is no "0"s between any two "1"s in the map.
+ * Args:
+ *     idsMap: The bitmap of IDs. The LSB stands for ID 0.
+ *     maxId: The maximum value of ID.
+ * Return:
+ *     Whether the idsMap is continous
+ *
+ * Example:
+ *     idsMaps like 00011100, 00001000, 00000000 are continuous
+ *     while 00110010 is not because there are 2 "0"s in bit 2, 3 surrounded by "1"s
+ */
+bool Orch::isItemIdsMapContinuous(unsigned long idsMap, sai_uint32_t maxId)
+{
+    unsigned long currentIdMask = 1;
+    bool isCurrentBitValid = false, hasValidBits = false, hasZeroAfterValidBit = false;
+
+    for (sai_uint32_t id = 0; id < maxId; id ++)
+    {
+        isCurrentBitValid = ((idsMap & currentIdMask) != 0);
+        if (isCurrentBitValid)
+        {
+            if (!hasValidBits)
+                hasValidBits = true;
+            if (hasZeroAfterValidBit)
+                return false;
+        }
+        else
+        {
+            if (hasValidBits && !hasZeroAfterValidBit)
+                hasZeroAfterValidBit = true;
+        }
+        currentIdMask <<= 1;
+    }
+
+    return true;
+}
+
 void Orch::addConsumer(DBConnector *db, string tableName, int pri)
 {
     if (db->getDbId() == CONFIG_DB || db->getDbId() == STATE_DB || db->getDbId() == CHASSIS_APP_DB)
@@ -658,6 +1110,10 @@ void Orch::addExecutor(Executor* executor)
     {
         SWSS_LOG_THROW("Duplicated executorName in m_consumerMap: %s", executor->getName().c_str());
     }
+
+    if (gRingBuffer && executor->getName() == APP_ROUTE_TABLE_NAME) {
+        gRingBuffer->addExecutor(executor);
+    }
 }
 
 Executor *Orch::getExecutor(string executorName)
@@ -669,193 +1125,6 @@ Executor *Orch::getExecutor(string executorName)
     }
 
     return NULL;
-}
-
-task_process_status Orch::handleSaiCreateStatus(sai_api_t api, sai_status_t status, void *context)
-{
-    /*
-     * This function aims to provide coarse handling of failures in sairedis create
-     * operation (i.e., notify users by throwing excepions when failures happen).
-     * Return value: task_success - Handled the status successfully. No need to retry this SAI operation.
-     *               task_need_retry - Cannot handle the status. Need to retry the SAI operation.
-     *               task_failed - Failed to handle the status but another attempt is unlikely to resolve the failure.
-     * TODO: 1. Add general handling logic for specific statuses (e.g., SAI_STATUS_ITEM_ALREADY_EXISTS)
-     *       2. Develop fine-grain failure handling mechanisms and replace this coarse handling
-     *          in each orch.
-     *       3. Take the type of sai api into consideration.
-     */
-    switch (api)
-    {
-        case SAI_API_FDB:
-            switch (status)
-            {
-                case SAI_STATUS_SUCCESS:
-                    SWSS_LOG_WARN("SAI_STATUS_SUCCESS is not expected in handleSaiCreateStatus");
-                    return task_success;
-                case SAI_STATUS_ITEM_ALREADY_EXISTS:
-                    /*
-                     *  In FDB creation, there are scenarios where the hardware learns an FDB entry before orchagent.
-                     *  In such cases, the FDB SAI creation would report the status of SAI_STATUS_ITEM_ALREADY_EXISTS,
-                     *  and orchagent should ignore the error and treat it as entry was explicitly created.
-                     */
-                    return task_success;
-                default:
-                    SWSS_LOG_ERROR("Encountered failure in create operation, exiting orchagent, SAI API: %s, status: %s",
-                                sai_serialize_api(api).c_str(), sai_serialize_status(status).c_str());
-                    exit(EXIT_FAILURE);
-            }
-            break;
-        case SAI_API_HOSTIF:
-            switch (status)
-            {
-                case SAI_STATUS_SUCCESS:
-                    return task_success;
-                case SAI_STATUS_FAILURE:
-                    /*
-                     * Host interface maybe failed due to lane not available.
-                     * In some scenarios, like SONiC virtual machine, the invalid lane may be not enabled by VM configuration,
-                     * So just ignore the failure and report an error log.
-                     */
-                    return task_ignore;
-                default:
-                    SWSS_LOG_ERROR("Encountered failure in create operation, exiting orchagent, SAI API: %s, status: %s",
-                                sai_serialize_api(api).c_str(), sai_serialize_status(status).c_str());
-                    exit(EXIT_FAILURE);
-            }
-        default:
-            switch (status)
-            {
-                case SAI_STATUS_SUCCESS:
-                    SWSS_LOG_WARN("SAI_STATUS_SUCCESS is not expected in handleSaiCreateStatus");
-                    return task_success;
-                default:
-                    SWSS_LOG_ERROR("Encountered failure in create operation, exiting orchagent, SAI API: %s, status: %s",
-                                sai_serialize_api(api).c_str(), sai_serialize_status(status).c_str());
-                    exit(EXIT_FAILURE);
-            }
-    }
-    return task_need_retry;
-}
-
-task_process_status Orch::handleSaiSetStatus(sai_api_t api, sai_status_t status, void *context)
-{
-    /*
-     * This function aims to provide coarse handling of failures in sairedis set
-     * operation (i.e., notify users by throwing excepions when failures happen).
-     * Return value: task_success - Handled the status successfully. No need to retry this SAI operation.
-     *               task_need_retry - Cannot handle the status. Need to retry the SAI operation.
-     *               task_failed - Failed to handle the status but another attempt is unlikely to resolve the failure.
-     * TODO: 1. Add general handling logic for specific statuses
-     *       2. Develop fine-grain failure handling mechanisms and replace this coarse handling
-     *          in each orch.
-     *       3. Take the type of sai api into consideration.
-     */
-    if (status == SAI_STATUS_SUCCESS)
-    {
-        SWSS_LOG_WARN("SAI_STATUS_SUCCESS is not expected in handleSaiSetStatus");
-        return task_success;
-    }
-
-    switch (api)
-    {
-        case SAI_API_PORT:
-            switch (status)
-            {
-                case SAI_STATUS_INVALID_ATTR_VALUE_0:
-                    /*
-                     * If user gives an invalid attribute value, no need to retry or exit orchagent, just fail the current task
-                     * and let user correct the configuration.
-                     */
-                    SWSS_LOG_ERROR("Encountered SAI_STATUS_INVALID_ATTR_VALUE_0 in set operation, task failed, SAI API: %s, status: %s",
-                            sai_serialize_api(api).c_str(), sai_serialize_status(status).c_str());
-                    return task_failed;
-                default:
-                    SWSS_LOG_ERROR("Encountered failure in set operation, exiting orchagent, SAI API: %s, status: %s",
-                            sai_serialize_api(api).c_str(), sai_serialize_status(status).c_str());
-                    exit(EXIT_FAILURE);
-            }
-        default:
-            SWSS_LOG_ERROR("Encountered failure in set operation, exiting orchagent, SAI API: %s, status: %s",
-                        sai_serialize_api(api).c_str(), sai_serialize_status(status).c_str());
-            exit(EXIT_FAILURE);
-    }
-
-    return task_need_retry;
-}
-
-task_process_status Orch::handleSaiRemoveStatus(sai_api_t api, sai_status_t status, void *context)
-{
-    /*
-     * This function aims to provide coarse handling of failures in sairedis remove
-     * operation (i.e., notify users by throwing excepions when failures happen).
-     * Return value: task_success - Handled the status successfully. No need to retry this SAI operation.
-     *               task_need_retry - Cannot handle the status. Need to retry the SAI operation.
-     *               task_failed - Failed to handle the status but another attempt is unlikely to resolve the failure.
-     * TODO: 1. Add general handling logic for specific statuses (e.g., SAI_STATUS_OBJECT_IN_USE,
-     *          SAI_STATUS_ITEM_NOT_FOUND)
-     *       2. Develop fine-grain failure handling mechanisms and replace this coarse handling
-     *          in each orch.
-     *       3. Take the type of sai api into consideration.
-     */
-    switch (status)
-    {
-        case SAI_STATUS_SUCCESS:
-            SWSS_LOG_WARN("SAI_STATUS_SUCCESS is not expected in handleSaiRemoveStatus");
-            return task_success;
-        default:
-            SWSS_LOG_ERROR("Encountered failure in remove operation, exiting orchagent, SAI API: %s, status: %s",
-                        sai_serialize_api(api).c_str(), sai_serialize_status(status).c_str());
-            exit(EXIT_FAILURE);
-    }
-    return task_need_retry;
-}
-
-task_process_status Orch::handleSaiGetStatus(sai_api_t api, sai_status_t status, void *context)
-{
-    /*
-     * This function aims to provide coarse handling of failures in sairedis get
-     * operation (i.e., notify users by throwing excepions when failures happen).
-     * Return value: task_success - Handled the status successfully. No need to retry this SAI operation.
-     *               task_need_retry - Cannot handle the status. Need to retry the SAI operation.
-     *               task_failed - Failed to handle the status but another attempt is unlikely to resolve the failure.
-     * TODO: 1. Add general handling logic for specific statuses
-     *       2. Develop fine-grain failure handling mechanisms and replace this coarse handling
-     *          in each orch.
-     *       3. Take the type of sai api into consideration.
-     */
-    switch (status)
-    {
-        case SAI_STATUS_SUCCESS:
-            SWSS_LOG_WARN("SAI_STATUS_SUCCESS is not expected in handleSaiGetStatus");
-            return task_success;
-        case SAI_STATUS_NOT_IMPLEMENTED:
-            SWSS_LOG_ERROR("Encountered failure in get operation due to the function is not implemented, exiting orchagent, SAI API: %s",
-                        sai_serialize_api(api).c_str());
-            throw std::logic_error("SAI get function not implemented");
-        default:
-            SWSS_LOG_ERROR("Encountered failure in get operation, SAI API: %s, status: %s",
-                        sai_serialize_api(api).c_str(), sai_serialize_status(status).c_str());
-    }
-    return task_failed;
-}
-
-bool Orch::parseHandleSaiStatusFailure(task_process_status status)
-{
-    /*
-     * This function parses task process status from SAI failure handling function to whether a retry is needed.
-     * Return value: true - no retry is needed.
-     *               false - retry is needed.
-     */
-    switch (status)
-    {
-        case task_need_retry:
-            return false;
-        case task_failed:
-            return true;
-        default:
-            SWSS_LOG_WARN("task_process_status %d is not expected in parseHandleSaiStatusFailure", status);
-    }
-    return true;
 }
 
 void Orch2::doTask(Consumer &consumer)
@@ -888,19 +1157,19 @@ void Orch2::doTask(Consumer &consumer)
         }
         catch (const std::invalid_argument& e)
         {
-            SWSS_LOG_ERROR("Parse error: %s", e.what());
+            SWSS_LOG_ERROR("Parse error in %s: %s", typeid(*this).name(), e.what());
         }
         catch (const std::logic_error& e)
         {
-            SWSS_LOG_ERROR("Logic error: %s", e.what());
+            SWSS_LOG_ERROR("Logic error in %s: %s", typeid(*this).name(), e.what());
         }
         catch (const std::exception& e)
         {
-            SWSS_LOG_ERROR("Exception was catched in the request parser: %s", e.what());
+            SWSS_LOG_ERROR("Exception was caught in the request parser in %s: %s", typeid(*this).name(), e.what());
         }
         catch (...)
         {
-            SWSS_LOG_ERROR("Unknown exception was catched in the request parser");
+            SWSS_LOG_ERROR("Unknown exception was caught in the request parser");
         }
         request_.clear();
 
@@ -914,4 +1183,3 @@ void Orch2::doTask(Consumer &consumer)
         }
     }
 }
-

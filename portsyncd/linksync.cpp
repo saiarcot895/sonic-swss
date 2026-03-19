@@ -2,7 +2,7 @@
 #include <errno.h>
 #include <system_error>
 #include <sys/socket.h>
-#include <linux/if.h>
+#include <net/if.h>
 #include <netlink/route/link.h>
 #include "logger.h"
 #include "netmsg.h"
@@ -27,73 +27,20 @@ using namespace swss;
 #define VLAN_DRV_NAME   "bridge"
 #define TEAM_DRV_NAME   "team"
 
-const string MGMT_PREFIX = "eth";
 const string INTFS_PREFIX = "Ethernet";
 const string LAG_PREFIX = "PortChannel";
 
 extern set<string> g_portSet;
 extern bool g_init;
-
-struct if_nameindex
-{
-    unsigned int if_index;
-    char *if_name;
-};
-extern "C" { extern struct if_nameindex *if_nameindex (void) __THROW; }
+extern string g_switchType;
 
 LinkSync::LinkSync(DBConnector *appl_db, DBConnector *state_db) :
     m_portTableProducer(appl_db, APP_PORT_TABLE_NAME),
     m_portTable(appl_db, APP_PORT_TABLE_NAME),
-    m_statePortTable(state_db, STATE_PORT_TABLE_NAME),
-    m_stateMgmtPortTable(state_db, STATE_MGMT_PORT_TABLE_NAME)
+    m_statePortTable(state_db, STATE_PORT_TABLE_NAME)
 {
-    struct if_nameindex *if_ni, *idx_p;
-    if_ni = if_nameindex();
-
-    for (idx_p = if_ni;
-            idx_p != NULL && idx_p->if_index != 0 && idx_p->if_name != NULL;
-            idx_p++)
-    {
-        string key = idx_p->if_name;
-
-        /* Explicitly store management ports oper status into the state database.
-         * This piece of information is used by SNMP. */
-        if (!key.compare(0, MGMT_PREFIX.length(), MGMT_PREFIX))
-        {
-            ostringstream cmd;
-            string res;
-            cmd << "cat /sys/class/net/" << shellquote(key) << "/operstate";
-            try
-            {
-                EXEC_WITH_ERROR_THROW(cmd.str(), res);
-            }
-            catch (...)
-            {
-                SWSS_LOG_WARN("Failed to get %s oper status", key.c_str());
-                continue;
-            }
-
-            /* Remove the trailing newline */
-            if (res.length() >= 1 && res.at(res.length() - 1) == '\n')
-            {
-                res.erase(res.length() - 1);
-                /* The value of operstate will be either up or down */
-                if (res != "up" && res != "down")
-                {
-                    SWSS_LOG_WARN("Unknown %s oper status %s",
-                            key.c_str(), res.c_str());
-                }
-                FieldValueTuple fv("oper_status", res);
-                vector<FieldValueTuple> fvs;
-                fvs.push_back(fv);
-
-                m_stateMgmtPortTable.set(key, fvs);
-                SWSS_LOG_INFO("Store %s oper status %s to state DB",
-                        key.c_str(), res.c_str());
-            }
-            continue;
-        }
-    }
+    std::shared_ptr<struct if_nameindex> if_ni(if_nameindex(), if_freenameindex);
+    struct if_nameindex *idx_p;
 
     if (!WarmStart::isWarmStart())
     {
@@ -121,7 +68,15 @@ LinkSync::LinkSync(DBConnector *appl_db, DBConnector *state_db) :
             }
         }
 
-        for (idx_p = if_ni;
+        /* In DPU SONiC netdevs in Kernel are created in the early stage of the syncd service start,
+         * when the driver is loading. And exist while the driver remains loaded. 
+         *The comparison logic to distinguish "old" interfaces is not needed. */
+        if (g_switchType == "dpu")
+        {
+            return;
+        }
+
+        for (idx_p = if_ni.get();
                 idx_p != NULL && idx_p->if_index != 0 && idx_p->if_name != NULL;
                 idx_p++)
         {
@@ -166,8 +121,7 @@ void LinkSync::onMsg(int nlmsg_type, struct nl_object *obj)
     string key = rtnl_link_get_name(link);
 
     if (key.compare(0, INTFS_PREFIX.length(), INTFS_PREFIX) &&
-        key.compare(0, LAG_PREFIX.length(), LAG_PREFIX) &&
-        key.compare(0, MGMT_PREFIX.length(), MGMT_PREFIX))
+        key.compare(0, LAG_PREFIX.length(), LAG_PREFIX))
     {
         return;
     }
@@ -182,27 +136,17 @@ void LinkSync::onMsg(int nlmsg_type, struct nl_object *obj)
     unsigned int ifindex = rtnl_link_get_ifindex(link);
     int master = rtnl_link_get_master(link);
     char *type = rtnl_link_get_type(link);
+    unsigned int mtu = rtnl_link_get_mtu(link);
 
     if (type)
     {
-        SWSS_LOG_NOTICE("nlmsg type:%d key:%s admin:%d oper:%d addr:%s ifindex:%d master:%d type:%s",
-                       nlmsg_type, key.c_str(), admin, oper, addrStr, ifindex, master, type);
+        SWSS_LOG_NOTICE("nlmsg type:%d key:%s admin:%d oper:%d addr:%s ifindex:%d master:%d type:%s flags:%d",
+                       nlmsg_type, key.c_str(), admin, oper, addrStr, ifindex, master, type, flags);
     }
     else
     {
-        SWSS_LOG_NOTICE("nlmsg type:%d key:%s admin:%d oper:%d addr:%s ifindex:%d master:%d",
-                       nlmsg_type, key.c_str(), admin, oper, addrStr, ifindex, master);
-    }
-
-    if (!key.compare(0, MGMT_PREFIX.length(), MGMT_PREFIX))
-    {
-        FieldValueTuple fv("oper_status", oper ? "up" : "down");
-        vector<FieldValueTuple> fvs;
-        fvs.push_back(fv);
-        m_stateMgmtPortTable.set(key, fvs);
-        SWSS_LOG_INFO("Store %s oper status %s to state DB",
-                key.c_str(), oper ? "up" : "down");
-        return;
+        SWSS_LOG_NOTICE("nlmsg type:%d key:%s admin:%d oper:%d addr:%s ifindex:%d master:%d flags:%d",
+                       nlmsg_type, key.c_str(), admin, oper, addrStr, ifindex, master, flags);
     }
 
     /* teamd instances are dealt in teamsyncd */
@@ -211,10 +155,9 @@ void LinkSync::onMsg(int nlmsg_type, struct nl_object *obj)
         return;
     }
 
-    /* If netlink for this port has master, we ignore that for now
-     * This could be the case where the port was removed from VLAN bridge
-     */
-    if (master)
+    /* Ignore DELLINK message if port has master, this is applicable to
+     * the case where port was part of VLAN bridge or LAG */
+    if (master && nlmsg_type == RTM_DELLINK)
     {
         return;
     }
@@ -251,10 +194,14 @@ void LinkSync::onMsg(int nlmsg_type, struct nl_object *obj)
     {
         g_portSet.erase(key);
         FieldValueTuple tuple("state", "ok");
+        FieldValueTuple admin_status("admin_status", (admin ? "up" : "down"));
+        FieldValueTuple port_mtu("mtu", to_string(mtu));
         vector<FieldValueTuple> vector;
         vector.push_back(tuple);
         FieldValueTuple op("netdev_oper_status", oper ? "up" : "down");
         vector.push_back(op);
+        vector.push_back(admin_status);
+        vector.push_back(port_mtu);
         m_statePortTable.set(key, vector);
         SWSS_LOG_NOTICE("Publish %s(ok:%s) to state db", key.c_str(), oper ? "up" : "down");
     }

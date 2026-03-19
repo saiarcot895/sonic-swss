@@ -34,7 +34,8 @@
 
 #define MIRROR_SESSION_DEFAULT_VLAN_PRI 0
 #define MIRROR_SESSION_DEFAULT_VLAN_CFI 0
-#define MIRROR_SESSION_DEFAULT_IP_HDR_VER 4
+#define MIRROR_SESSION_IP_HDR_VER_4     4
+#define MIRROR_SESSION_IP_HDR_VER_6     6
 #define MIRROR_SESSION_DSCP_SHIFT       2
 #define MIRROR_SESSION_DSCP_MIN         0
 #define MIRROR_SESSION_DSCP_MAX         63
@@ -76,13 +77,14 @@ MirrorEntry::MirrorEntry(const string& platform) :
 }
 
 MirrorOrch::MirrorOrch(TableConnector stateDbConnector, TableConnector confDbConnector,
-        PortsOrch *portOrch, RouteOrch *routeOrch, NeighOrch *neighOrch, FdbOrch *fdbOrch, PolicerOrch *policerOrch) :
+        PortsOrch *portOrch, RouteOrch *routeOrch, NeighOrch *neighOrch, FdbOrch *fdbOrch, PolicerOrch *policerOrch, SwitchOrch *switchOrch) :
         Orch(confDbConnector.first, confDbConnector.second),
         m_portsOrch(portOrch),
         m_routeOrch(routeOrch),
         m_neighOrch(neighOrch),
         m_fdbOrch(fdbOrch),
         m_policerOrch(policerOrch),
+        m_switchOrch(switchOrch),
         m_mirrorTable(stateDbConnector.first, stateDbConnector.second)
 {
     sai_status_t status;
@@ -327,8 +329,9 @@ bool MirrorOrch::validateSrcPortList(const string& srcPortList)
             if (port.m_type == Port::LAG)
             {
                 vector<Port> portv;
+                int portCount = 0;
                 m_portsOrch->getLagMember(port, portv);
-                for (const auto p : portv)
+                for (const auto &p : portv)
                 {
                     if (checkPortExistsInSrcPortList(p.m_alias, srcPortList))
                     {
@@ -336,6 +339,13 @@ bool MirrorOrch::validateSrcPortList(const string& srcPortList)
                                   p.m_alias.c_str(), port.m_alias.c_str(), srcPortList.c_str());
                         return false;
                     }
+                    portCount++;
+                }
+                if (!portCount)
+                {
+                    SWSS_LOG_ERROR("Source LAG %s is empty. set mirror session to inactive",
+                             port.m_alias.c_str());;
+                    return false;
                 }
             }
         }
@@ -344,15 +354,41 @@ bool MirrorOrch::validateSrcPortList(const string& srcPortList)
     return true;
 }
 
+bool MirrorOrch::isHwResourcesAvailable()
+{
+    uint64_t availCount = 0;
+
+    sai_status_t status = sai_object_type_get_availability(
+        gSwitchId, SAI_OBJECT_TYPE_MIRROR_SESSION, 0, nullptr, &availCount
+    );
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        if ((status == SAI_STATUS_NOT_SUPPORTED) ||
+            (status == SAI_STATUS_NOT_IMPLEMENTED) ||
+            SAI_STATUS_IS_ATTR_NOT_SUPPORTED(status) ||
+            SAI_STATUS_IS_ATTR_NOT_IMPLEMENTED(status))
+        {
+            SWSS_LOG_WARN("Mirror session resource availability monitoring is not supported. Skipping ...");
+            return true;
+        }
+
+        return parseHandleSaiStatusFailure(handleSaiGetStatus(SAI_API_MIRROR, status));
+    }
+
+    return availCount > 0;
+}
+
 task_process_status MirrorOrch::createEntry(const string& key, const vector<FieldValueTuple>& data)
 {
     SWSS_LOG_ENTER();
 
+    bool src_ip_initialized = false;
+    bool dst_ip_initialized = false;
+
     auto session = m_syncdMirrors.find(key);
     if (session != m_syncdMirrors.end())
     {
-        SWSS_LOG_NOTICE("Failed to create session, session %s already exists",
-                key.c_str());
+        SWSS_LOG_NOTICE("Failed to create session %s: object already exists", key.c_str());
         return task_process_status::task_duplicated;
     }
 
@@ -365,20 +401,12 @@ task_process_status MirrorOrch::createEntry(const string& key, const vector<Fiel
             if (fvField(i) == MIRROR_SESSION_SRC_IP)
             {
                 entry.srcIp = fvValue(i);
-                if (!entry.srcIp.isV4())
-                {
-                    SWSS_LOG_ERROR("Unsupported version of sessions %s source IP address", key.c_str());
-                    return task_process_status::task_invalid_entry;
-                }
+                src_ip_initialized = true;
             }
             else if (fvField(i) == MIRROR_SESSION_DST_IP)
             {
                 entry.dstIp = fvValue(i);
-                if (!entry.dstIp.isV4())
-                {
-                    SWSS_LOG_ERROR("Unsupported version of sessions %s destination IP address", key.c_str());
-                    return task_process_status::task_invalid_entry;
-                }
+                dst_ip_initialized = true;
             }
             else if (fvField(i) == MIRROR_SESSION_GRE_TYPE)
             {
@@ -462,11 +490,20 @@ task_process_status MirrorOrch::createEntry(const string& key, const vector<Fiel
             return task_process_status::task_failed;
         }
     }
+    // Entry validation as a whole
+    if (src_ip_initialized && dst_ip_initialized && entry.srcIp.getIp().family != entry.dstIp.getIp().family)
+    {
+        SWSS_LOG_ERROR("Address family of source and destination IPs is different");
+        return task_process_status::task_invalid_entry;
+    }
+
+    if (!isHwResourcesAvailable())
+    {
+        SWSS_LOG_ERROR("Failed to create session %s: HW resources are not available", key.c_str());
+        return task_process_status::task_failed;
+    }
 
     m_syncdMirrors.emplace(key, entry);
-
-    SWSS_LOG_NOTICE("Created mirror session %s", key.c_str());
-
     setSessionState(key, entry);
 
     if (entry.type == MIRROR_SESSION_SPAN && !entry.dst_port.empty())
@@ -479,6 +516,8 @@ task_process_status MirrorOrch::createEntry(const string& key, const vector<Fiel
         // Attach the destination IP to the routeOrch
         m_routeOrch->attach(this, entry.dstIp);
     }
+
+    SWSS_LOG_NOTICE("Created mirror session %s", key.c_str());
 
     return task_process_status::task_success;
 }
@@ -550,13 +589,30 @@ void MirrorOrch::setSessionState(const string& name, const MirrorEntry& session,
     if (attr.empty() || attr == MIRROR_SESSION_MONITOR_PORT)
     {
         Port port;
-        m_portsOrch->getPort(session.neighborInfo.portId, port);
+        if ((gMySwitchType == "voq") && (session.type == MIRROR_SESSION_ERSPAN))
+        {
+             if (!m_portsOrch->getRecircPort(port, Port::Role::Rec))
+             {
+                 SWSS_LOG_ERROR("Failed to get recirc port for mirror session %s", name.c_str());
+                 return;
+             }
+	}
+	else
+	{
+           m_portsOrch->getPort(session.neighborInfo.portId, port);
+	}
         fvVector.emplace_back(MIRROR_SESSION_MONITOR_PORT, port.m_alias);
     }
 
     if (attr.empty() || attr == MIRROR_SESSION_DST_MAC_ADDRESS)
     {
-        value = session.neighborInfo.mac.to_string();
+        if ((gMySwitchType == "voq") && (session.type == MIRROR_SESSION_ERSPAN))
+        {
+             value = gMacAddress.to_string();
+        } else
+        {
+             value = session.neighborInfo.mac.to_string();
+        }
         fvVector.emplace_back(MIRROR_SESSION_DST_MAC_ADDRESS, value);
     }
 
@@ -757,6 +813,18 @@ bool MirrorOrch::setUnsetPortMirror(Port port,
                                     bool set,
                                     sai_object_id_t sessionId)
 {
+    // Check if the mirror direction is supported by the ASIC
+    if (ingress && !m_switchOrch->isPortIngressMirrorSupported())
+    {
+        SWSS_LOG_ERROR("Port ingress mirror is not supported by the ASIC");
+        return false;
+    }
+    if (!ingress && !m_switchOrch->isPortEgressMirrorSupported())
+    {
+        SWSS_LOG_ERROR("Port egress mirror is not supported by the ASIC");
+        return false;
+    }
+
     sai_status_t status;
     sai_attribute_t port_attr;
     port_attr.id = ingress ? SAI_PORT_ATTR_INGRESS_MIRROR_SESSION:
@@ -764,8 +832,7 @@ bool MirrorOrch::setUnsetPortMirror(Port port,
     if (set)
     {
         port_attr.value.objlist.count = 1;
-        port_attr.value.objlist.list = reinterpret_cast<sai_object_id_t *>(calloc(port_attr.value.objlist.count, sizeof(sai_object_id_t)));
-        port_attr.value.objlist.list[0] = sessionId;
+        port_attr.value.objlist.list = &sessionId;
     }
     else
     {
@@ -776,7 +843,7 @@ bool MirrorOrch::setUnsetPortMirror(Port port,
     {
         vector<Port> portv;
         m_portsOrch->getLagMember(port, portv);
-        for (const auto p : portv)
+        for (const auto &p : portv)
         {
             if (p.m_type != Port::PHY)
             {
@@ -894,9 +961,9 @@ bool MirrorOrch::activateSession(const string& name, MirrorEntry& session)
         if (gMySwitchType == "voq")
         {
             Port recirc_port;
-            if (!m_portsOrch->getRecircPort(recirc_port, "Rec"))
+            if (!m_portsOrch->getRecircPort(recirc_port, Port::Role::Rec))
             {
-                SWSS_LOG_ERROR("Failed to get recirc prot");
+                SWSS_LOG_ERROR("Failed to get recirc port");
                 return false;
             }
             attr.value.oid = recirc_port.m_port_id;
@@ -940,7 +1007,7 @@ bool MirrorOrch::activateSession(const string& name, MirrorEntry& session)
         attrs.push_back(attr);
 
         attr.id = SAI_MIRROR_SESSION_ATTR_IPHDR_VERSION;
-        attr.value.u8 = MIRROR_SESSION_DEFAULT_IP_HDR_VER;
+        attr.value.u8 = session.dstIp.isV4() ? MIRROR_SESSION_IP_HDR_VER_4 : MIRROR_SESSION_IP_HDR_VER_6;
         attrs.push_back(attr);
 
         // TOS value format is the following:
@@ -967,9 +1034,9 @@ bool MirrorOrch::activateSession(const string& name, MirrorEntry& session)
 
         attr.id = SAI_MIRROR_SESSION_ATTR_DST_MAC_ADDRESS;
         // Use router mac as mirror dst mac in voq switch.
-        if (gMySwitchType == "voq")
+        if ((gMySwitchType == "voq") && (session.type == MIRROR_SESSION_ERSPAN))
         {
-            memcpy(attr.value.mac, gMacAddress.getMac(), sizeof(sai_mac_t));
+             memcpy(attr.value.mac, gMacAddress.getMac(), sizeof(sai_mac_t));
         }
         else
         {
@@ -1083,13 +1150,19 @@ bool MirrorOrch::updateSessionDstMac(const string& name, MirrorEntry& session)
 
     sai_attribute_t attr;
     attr.id = SAI_MIRROR_SESSION_ATTR_DST_MAC_ADDRESS;
-    memcpy(attr.value.mac, session.neighborInfo.mac.getMac(), sizeof(sai_mac_t));
+    if ((gMySwitchType == "voq") && (session.type == MIRROR_SESSION_ERSPAN))
+    {
+         memcpy(attr.value.mac, gMacAddress.getMac(), sizeof(sai_mac_t));
+    } else
+    {
+         memcpy(attr.value.mac, session.neighborInfo.mac.getMac(), sizeof(sai_mac_t));
+    }
 
     sai_status_t status = sai_mirror_api->set_mirror_session_attribute(session.sessionId, &attr);
     if (status != SAI_STATUS_SUCCESS)
     {
         SWSS_LOG_ERROR("Failed to update mirror session %s destination MAC to %s, rv:%d",
-                name.c_str(), session.neighborInfo.mac.to_string().c_str(), status);
+                name.c_str(), sai_serialize_mac(attr.value.mac).c_str(), status);
         task_process_status handle_status =  handleSaiSetStatus(SAI_API_MIRROR, status);
         if (handle_status != task_success)
         {
@@ -1098,7 +1171,7 @@ bool MirrorOrch::updateSessionDstMac(const string& name, MirrorEntry& session)
     }
 
     SWSS_LOG_NOTICE("Update mirror session %s destination MAC to %s",
-            name.c_str(), session.neighborInfo.mac.to_string().c_str());
+            name.c_str(), sai_serialize_mac(attr.value.mac).c_str());
 
     setSessionState(name, session, MIRROR_SESSION_DST_MAC_ADDRESS);
 
@@ -1116,7 +1189,20 @@ bool MirrorOrch::updateSessionDstPort(const string& name, MirrorEntry& session)
 
     sai_attribute_t attr;
     attr.id = SAI_MIRROR_SESSION_ATTR_MONITOR_PORT;
-    attr.value.oid = session.neighborInfo.portId;
+    // Set monitor port to recirc port in voq switch.
+    if ((gMySwitchType == "voq") && (session.type == MIRROR_SESSION_ERSPAN))
+    {
+         if (!m_portsOrch->getRecircPort(port, Port::Role::Rec))
+         {
+             SWSS_LOG_ERROR("Failed to get recirc port for mirror session %s", name.c_str());
+             return false;
+         }
+         attr.value.oid = port.m_port_id;
+    }
+    else
+    {
+         attr.value.oid = session.neighborInfo.portId;
+    }
 
     sai_status_t status = sai_mirror_api->
         set_mirror_session_attribute(session.sessionId, &attr);
@@ -1270,7 +1356,7 @@ void MirrorOrch::updateNextHop(const NextHopUpdate& update)
         else
         {
             string alias = "";
-            session.nexthopInfo.nexthop = NextHopKey("0.0.0.0", alias);
+            session.nexthopInfo.nexthop = session.dstIp.isV4() ? NextHopKey("0.0.0.0", alias) : NextHopKey("::", alias);
         }
 
         // Update State DB Nexthop

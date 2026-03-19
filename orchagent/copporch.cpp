@@ -1,8 +1,20 @@
+extern "C" {
+#include <saiobject.h>
+#include <saistatus.h>
+#include <saiswitch.h>
+}
+
 #include "sai.h"
 #include "copporch.h"
 #include "portsorch.h"
+#include "flexcounterorch.h"
 #include "tokenize.h"
 #include "logger.h"
+#include "sai_serialize.h"
+#include "schema.h"
+#include "directory.h"
+#include "flow_counter_handler.h"
+#include "timer.h"
 
 #include <inttypes.h>
 #include <sstream>
@@ -18,7 +30,11 @@ extern sai_switch_api_t*    sai_switch_api;
 
 extern sai_object_id_t      gSwitchId;
 extern PortsOrch*           gPortsOrch;
+extern Directory<Orch*>     gDirectory;
 extern bool                 gIsNatSupported;
+extern bool                 gTraditionalFlexCounter;
+
+#define FLEX_COUNTER_UPD_INTERVAL 1
 
 static map<string, sai_meter_type_t> policer_meter_map = {
     {"packets", SAI_METER_TYPE_PACKETS},
@@ -79,8 +95,80 @@ static map<string, sai_hostif_trap_type_t> trap_id_map = {
     {"dest_nat_miss", SAI_HOSTIF_TRAP_TYPE_DNAT_MISS},
     {"ldp", SAI_HOSTIF_TRAP_TYPE_LDP},
     {"bfd_micro", SAI_HOSTIF_TRAP_TYPE_BFD_MICRO},
-    {"bfdv6_micro", SAI_HOSTIF_TRAP_TYPE_BFDV6_MICRO}
+    {"bfdv6_micro", SAI_HOSTIF_TRAP_TYPE_BFDV6_MICRO},
+    {"neighbor_miss", SAI_HOSTIF_TRAP_TYPE_NEIGHBOR_MISS}
 };
+
+/*
+ * List of default supported traps used as a fallback when the vendor SAI
+ * does not support capability query for the HOSTIF object.
+ */
+const vector<sai_hostif_trap_type_t> default_supported_trap_ids = {
+    SAI_HOSTIF_TRAP_TYPE_STP,
+    SAI_HOSTIF_TRAP_TYPE_LACP,
+    SAI_HOSTIF_TRAP_TYPE_EAPOL,
+    SAI_HOSTIF_TRAP_TYPE_LLDP,
+    SAI_HOSTIF_TRAP_TYPE_PVRST,
+    SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_QUERY,
+    SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_LEAVE,
+    SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_V1_REPORT,
+    SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_V2_REPORT,
+    SAI_HOSTIF_TRAP_TYPE_IGMP_TYPE_V3_REPORT,
+    SAI_HOSTIF_TRAP_TYPE_SAMPLEPACKET,
+    SAI_HOSTIF_TRAP_TYPE_SWITCH_CUSTOM_RANGE_BASE,
+    SAI_HOSTIF_TRAP_TYPE_ARP_REQUEST,
+    SAI_HOSTIF_TRAP_TYPE_ARP_RESPONSE,
+    SAI_HOSTIF_TRAP_TYPE_DHCP,
+    SAI_HOSTIF_TRAP_TYPE_OSPF,
+    SAI_HOSTIF_TRAP_TYPE_PIM,
+    SAI_HOSTIF_TRAP_TYPE_VRRP,
+    SAI_HOSTIF_TRAP_TYPE_BGP,
+    SAI_HOSTIF_TRAP_TYPE_DHCPV6,
+    SAI_HOSTIF_TRAP_TYPE_OSPFV6,
+    SAI_HOSTIF_TRAP_TYPE_ISIS,
+    SAI_HOSTIF_TRAP_TYPE_VRRPV6,
+    SAI_HOSTIF_TRAP_TYPE_BGPV6,
+    SAI_HOSTIF_TRAP_TYPE_IPV6_NEIGHBOR_DISCOVERY,
+    SAI_HOSTIF_TRAP_TYPE_IPV6_MLD_V1_V2,
+    SAI_HOSTIF_TRAP_TYPE_IPV6_MLD_V1_REPORT,
+    SAI_HOSTIF_TRAP_TYPE_IPV6_MLD_V1_DONE,
+    SAI_HOSTIF_TRAP_TYPE_MLD_V2_REPORT,
+    SAI_HOSTIF_TRAP_TYPE_IP2ME,
+    SAI_HOSTIF_TRAP_TYPE_SSH,
+    SAI_HOSTIF_TRAP_TYPE_SNMP,
+    SAI_HOSTIF_TRAP_TYPE_ROUTER_CUSTOM_RANGE_BASE,
+    SAI_HOSTIF_TRAP_TYPE_L3_MTU_ERROR,
+    SAI_HOSTIF_TRAP_TYPE_TTL_ERROR,
+    SAI_HOSTIF_TRAP_TYPE_UDLD,
+    SAI_HOSTIF_TRAP_TYPE_BFD,
+    SAI_HOSTIF_TRAP_TYPE_BFDV6,
+    SAI_HOSTIF_TRAP_TYPE_SNAT_MISS,
+    SAI_HOSTIF_TRAP_TYPE_DNAT_MISS,
+    SAI_HOSTIF_TRAP_TYPE_LDP,
+    SAI_HOSTIF_TRAP_TYPE_BFD_MICRO,
+    SAI_HOSTIF_TRAP_TYPE_BFDV6_MICRO
+    /* This list is intended to remain static and should not be updated with new traps. */
+};
+
+std::string get_trap_name_by_type(sai_hostif_trap_type_t trap_type)
+{
+    static map<sai_hostif_trap_type_t, string> trap_name_to_id_map;
+    if (trap_name_to_id_map.empty())
+    {
+        for (const auto &kv : trap_id_map)
+        {
+            trap_name_to_id_map.emplace(kv.second, kv.first);
+        }
+    }
+
+    auto it = trap_name_to_id_map.find(trap_type);
+    if (it == trap_name_to_id_map.end())
+    {
+        return "";
+    }
+
+    return it->second;
+}
 
 static map<string, sai_packet_action_t> packet_action_map = {
     {"drop", SAI_PACKET_ACTION_DROP},
@@ -98,15 +186,118 @@ const vector<sai_hostif_trap_type_t> default_trap_ids = {
     SAI_HOSTIF_TRAP_TYPE_TTL_ERROR
 };
 
+const uint HOSTIF_TRAP_COUNTER_POLLING_INTERVAL_MS = 10000;
+
 CoppOrch::CoppOrch(DBConnector* db, string tableName) :
-    Orch(db, tableName)
+    Orch(db, tableName),
+    m_counter_db(std::shared_ptr<DBConnector>(new DBConnector("COUNTERS_DB", 0))),
+    m_asic_db(std::shared_ptr<DBConnector>(new DBConnector("ASIC_DB", 0))),
+    m_state_db(std::shared_ptr<DBConnector>(new DBConnector("STATE_DB", 0))),
+    m_counter_table(std::unique_ptr<Table>(new Table(m_counter_db.get(), COUNTERS_TRAP_NAME_MAP))),
+    m_vidToRidTable(std::unique_ptr<Table>(new Table(m_asic_db.get(), "VIDTORID"))),
+    m_trap_counter_manager(HOSTIF_TRAP_COUNTER_FLEX_COUNTER_GROUP, StatsMode::READ, HOSTIF_TRAP_COUNTER_POLLING_INTERVAL_MS, false),
+    m_trapCapabilityTable(std::unique_ptr<Table>(new Table(m_state_db.get(), STATE_COPP_TRAP_CAPABILITY_TABLE_NAME))),
+    m_trapTable(std::unique_ptr<Table>(new Table(m_state_db.get(), STATE_COPP_TRAP_TABLE_NAME)))
 {
     SWSS_LOG_ENTER();
+    auto intervT = timespec { .tv_sec = FLEX_COUNTER_UPD_INTERVAL , .tv_nsec = 0 };
+    m_FlexCounterUpdTimer = new SelectableTimer(intervT);
+    auto executorT = new ExecutableTimer(m_FlexCounterUpdTimer, this, "FLEX_COUNTER_UPD_TIMER");
+    Orch::addExecutor(executorT);
+
+    /* Query SAI for supported trap IDs and publish to STATE_DB */
+    publishTrapIdsCapability();
 
     initDefaultHostIntfTable();
     initDefaultTrapGroup();
     initDefaultTrapIds();
+
 };
+
+bool CoppOrch::isTrapIdSupported(sai_hostif_trap_type_t trap_id) const
+{
+    return supported_trap_ids.find(trap_id) != supported_trap_ids.end();
+}
+
+void CoppOrch::updateTrapOperStatus(sai_hostif_trap_type_t trap_type, const string& hw_status)
+{
+    SWSS_LOG_ENTER();
+
+    string trap_name = get_trap_name_by_type(trap_type);
+    if (trap_name.empty())
+    {
+        SWSS_LOG_ERROR("Failed to get trap name for type %d", trap_type);
+        return;
+    }
+
+    // Update or add the hw_status field in the table
+    vector<FieldValueTuple> hwStatusFvs;
+    hwStatusFvs.emplace_back("hw_status", hw_status);
+    m_trapTable->set(trap_name, hwStatusFvs);
+}
+
+// Query SAI for trap IDs capability and publish to the COPP_TRAP_CAPABILITY_TABLE
+void CoppOrch::publishTrapIdsCapability()
+{
+    SWSS_LOG_ENTER();
+
+    sai_s32_list_t enum_values_capability;
+
+    supported_trap_ids.clear();
+
+    const auto* meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_HOSTIF_TRAP, SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE);
+    if (!meta || !meta->isenum) 
+    {
+        SWSS_LOG_WARN("sai_metadata_get_attr_metadata for SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE Failed");
+        return;    
+    }
+
+    vector<int32_t> values_list(meta->enummetadata->valuescount);    
+    enum_values_capability.count = static_cast<uint32_t>(values_list.size());
+    enum_values_capability.list = values_list.data();
+
+    sai_status_t status = sai_query_attribute_enum_values_capability(gSwitchId,
+                                                                     SAI_OBJECT_TYPE_HOSTIF_TRAP,
+                                                                     SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE,
+                                                                     &enum_values_capability);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_NOTICE("SAI capability query for SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE is failed,"
+                        " falling back to default supported trap IDs");
+        // Populate enum_values_capability with default_supported_trap_ids
+        enum_values_capability.count = static_cast<uint32_t>(default_supported_trap_ids.size());
+        values_list.assign(default_supported_trap_ids.begin(), default_supported_trap_ids.end());
+        enum_values_capability.list = values_list.data();
+    }
+
+    SWSS_LOG_NOTICE("Number of supported trap IDs: %u", enum_values_capability.count);
+
+    string trap_id_list_str;
+
+    for (uint32_t i = 0; i < enum_values_capability.count; i++)
+    {
+
+        auto trap_str = get_trap_name_by_type(static_cast<sai_hostif_trap_type_t>(enum_values_capability.list[i]));
+        if (trap_str.empty())
+        {
+            SWSS_LOG_NOTICE("Unknown trap id enum value: %d", enum_values_capability.list[i]);
+            continue;
+        }
+
+        supported_trap_ids.insert(static_cast<sai_hostif_trap_type_t>(enum_values_capability.list[i]));
+
+        if (!trap_id_list_str.empty())
+        {          
+            trap_id_list_str += ",";
+        }
+        trap_id_list_str += trap_str;
+    }
+
+    SWSS_LOG_NOTICE("Publishing supported trap IDs to STATE_DB");
+    vector<FieldValueTuple> trapCapabilityFvs;
+    trapCapabilityFvs.push_back(FieldValueTuple("trap_ids", trap_id_list_str));
+    m_trapCapabilityTable->set("traps", trapCapabilityFvs);
+}
 
 void CoppOrch::initDefaultHostIntfTable()
 {
@@ -153,13 +344,17 @@ void CoppOrch::initDefaultTrapIds()
     attr.value.oid = m_trap_group_map[default_trap_group];
     trap_id_attrs.push_back(attr);
 
-    /* Mellanox platform doesn't support trap priority setting */
-    /* Marvell platform doesn't support trap priority. */
+    /*
+     * Use a default trap priority > 0 to avoid undesirable packet trapping
+     * behavior on some platforms that use 0 as default SAI-internal priority.
+     * Note: Mellanox and Marvell platforms don't support trap priority setting.
+     */
+
     char *platform = getenv("platform");
-    if (!platform || (!strstr(platform, MLNX_PLATFORM_SUBSTRING) && (!strstr(platform, MRVL_PLATFORM_SUBSTRING))))
+    if (!platform || (!strstr(platform, MLNX_PLATFORM_SUBSTRING) && (!strstr(platform, MRVL_PRST_PLATFORM_SUBSTRING))))
     {
         attr.id = SAI_HOSTIF_TRAP_ATTR_TRAP_PRIORITY;
-        attr.value.u32 = 0;
+        attr.value.u32 = 1;
         trap_id_attrs.push_back(attr);
     }
 
@@ -209,6 +404,14 @@ void CoppOrch::getTrapIdList(vector<string> &trap_id_name_list, vector<sai_hosti
             SWSS_LOG_NOTICE("Ignoring the trap_id: %s, as NAT is not supported", trap_id_str.c_str());
             continue;
         }
+
+        if (!isTrapIdSupported(trap_id))
+        {
+            /* If the trap_id is not in supported_trap_ids, ignore it */
+            SWSS_LOG_NOTICE("Ignoring the trap_id: %s, since not supported by vendor SAI", trap_id_str.c_str());
+            continue;
+        }
+
         trap_id_list.push_back(trap_id);
     }
 }
@@ -319,8 +522,12 @@ bool CoppOrch::applyAttributesToTrapIds(sai_object_id_t trap_group_id,
                 return parseHandleSaiStatusFailure(handle_status);
             }
         }
+
+        updateTrapOperStatus(trap_id, "installed");
         m_syncdTrapIds[trap_id].trap_group_obj = trap_group_id;
         m_syncdTrapIds[trap_id].trap_obj = hostif_trap_id;
+        m_syncdTrapIds[trap_id].trap_type = trap_id;
+        bindTrapCounter(hostif_trap_id, trap_id);
     }
     return true;
 }
@@ -331,7 +538,7 @@ bool CoppOrch::removePolicer(string trap_group_name)
 
     sai_attribute_t attr;
     sai_status_t sai_status;
-    sai_object_id_t policer_id = getPolicer(trap_group_name);
+    sai_object_id_t policer_id = getPolicer(trap_group_name).policer_id;
 
     if (SAI_NULL_OBJECT_ID == policer_id)
     {
@@ -369,21 +576,21 @@ bool CoppOrch::removePolicer(string trap_group_name)
     return true;
 }
 
-sai_object_id_t CoppOrch::getPolicer(string trap_group_name)
+policer_object CoppOrch::getPolicer(string trap_group_name)
 {
     SWSS_LOG_ENTER();
 
     SWSS_LOG_DEBUG("trap group name:%s:", trap_group_name.c_str());
     if (m_trap_group_map.find(trap_group_name) == m_trap_group_map.end())
     {
-        return SAI_NULL_OBJECT_ID;
+        return policer_object();
     }
     SWSS_LOG_DEBUG("trap group id:%" PRIx64, m_trap_group_map[trap_group_name]);
     if (m_trap_group_policer_map.find(m_trap_group_map[trap_group_name]) == m_trap_group_policer_map.end())
     {
-        return SAI_NULL_OBJECT_ID;
+        return policer_object();
     }
-    SWSS_LOG_DEBUG("trap group policer id:%" PRIx64, m_trap_group_policer_map[m_trap_group_map[trap_group_name]]);
+    SWSS_LOG_DEBUG("trap group policer id:%" PRIx64, m_trap_group_policer_map[m_trap_group_map[trap_group_name]].policer_id);
     return m_trap_group_policer_map[m_trap_group_map[trap_group_name]];
 }
 
@@ -422,8 +629,28 @@ bool CoppOrch::createPolicer(string trap_group_name, vector<sai_attribute_t> &po
         }
     }
 
+    policer_object obj;
+    obj.policer_id = policer_id;
+    /* Save the CREATE_ONLY attributes for future use */
+    for (sai_uint32_t ind = 0; ind < policer_attribs.size(); ind++)
+    {
+        auto attr = policer_attribs[ind];
+        if(attr.id == SAI_POLICER_ATTR_METER_TYPE)
+        {
+            obj.meter = (sai_meter_type_t)attr.value.s32;
+        }
+        else if(attr.id == SAI_POLICER_ATTR_MODE)
+        {
+            obj.mode = (sai_policer_mode_t)attr.value.s32;
+        }
+        else if(attr.id == SAI_POLICER_ATTR_COLOR_SOURCE)
+        {
+            obj.color = (sai_policer_color_source_t)attr.value.s32;
+        }
+    }
+
     SWSS_LOG_NOTICE("Bind policer to trap group %s:", trap_group_name.c_str());
-    m_trap_group_policer_map[m_trap_group_map[trap_group_name]] = policer_id;
+    m_trap_group_policer_map[m_trap_group_map[trap_group_name]] = obj;
     return true;
 }
 
@@ -575,7 +802,7 @@ task_process_status CoppOrch::processCoppRule(Consumer& consumer)
         if (!trap_id_attribs.empty())
         {
             vector<sai_hostif_trap_type_t> group_trap_ids;
-            TrapIdAttribs trap_attr;
+            TrapIdAttribs trap_attr = m_trap_group_trap_id_attrs[trap_group_name];
             getTrapIdsFromTrapGroup(m_trap_group_map[trap_group_name],
                                     group_trap_ids);
             for (auto trap_id : group_trap_ids)
@@ -706,6 +933,35 @@ void CoppOrch::doTask(Consumer &consumer)
     }
 }
 
+void CoppOrch::doTask(SelectableTimer &timer)
+{
+    SWSS_LOG_ENTER();
+
+    string value;
+    for (auto it = m_pendingAddToFlexCntr.begin(); it != m_pendingAddToFlexCntr.end(); )
+    {
+        const auto id = sai_serialize_object_id(it->first);
+        if (!gTraditionalFlexCounter || m_vidToRidTable->hget("", id, value))
+        {
+            SWSS_LOG_INFO("Registering %s, id %s", it->second.c_str(), id.c_str());
+
+            std::unordered_set<std::string> counter_stats;
+            FlowCounterHandler::getGenericCounterStatIdList(counter_stats);
+            m_trap_counter_manager.setCounterIdList(it->first, CounterType::HOSTIF_TRAP, counter_stats);
+            it = m_pendingAddToFlexCntr.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    if (m_pendingAddToFlexCntr.empty())
+    {
+        m_FlexCounterUpdTimer->stop();
+    }
+}
+
 void CoppOrch::getTrapAddandRemoveList(string trap_group_name,
                                        vector<sai_hostif_trap_type_t> &trap_ids,
                                        vector<sai_hostif_trap_type_t> &add_trap_ids,
@@ -713,6 +969,7 @@ void CoppOrch::getTrapAddandRemoveList(string trap_group_name,
 {
 
     vector<sai_hostif_trap_type_t> tmp_trap_ids = trap_ids;
+   
     if(m_trap_group_map.find(trap_group_name) == m_trap_group_map.end())
     {
         add_trap_ids = trap_ids;
@@ -777,17 +1034,9 @@ bool CoppOrch::trapGroupProcessTrapIdChange (string trap_group_name,
         {
             if (m_syncdTrapIds.find(i)!= m_syncdTrapIds.end())
             {
-                sai_status_t sai_status = sai_hostif_api->remove_hostif_trap(
-                                                             m_syncdTrapIds[i].trap_obj);
-                if (sai_status != SAI_STATUS_SUCCESS)
+                if (!removeTrap(m_syncdTrapIds[i].trap_obj, i))
                 {
-                    SWSS_LOG_ERROR("Failed to remove trap object %" PRId64 "",
-                            m_syncdTrapIds[i].trap_obj);
-                    task_process_status handle_status = handleSaiRemoveStatus(SAI_API_HOSTIF, sai_status);
-                    if (handle_status != task_success)
-                    {
-                        return parseHandleSaiStatusFailure(handle_status);
-                    }
+                    return false;
                 }
             }
         }
@@ -830,17 +1079,9 @@ bool CoppOrch::trapGroupProcessTrapIdChange (string trap_group_name,
                  */
                 if (m_syncdTrapIds[i].trap_group_obj ==  m_trap_group_map[trap_group_name])
                 {
-                    sai_status_t sai_status = sai_hostif_api->remove_hostif_trap(
-                                                                    m_syncdTrapIds[i].trap_obj);
-                    if (sai_status != SAI_STATUS_SUCCESS)
+                    if (!removeTrap(m_syncdTrapIds[i].trap_obj, i))
                     {
-                        SWSS_LOG_ERROR("Failed to remove trap object %" PRId64 "",
-                                       m_syncdTrapIds[i].trap_obj);
-                        task_process_status handle_status = handleSaiRemoveStatus(SAI_API_HOSTIF, sai_status);
-                        if (handle_status != task_success)
-                        {
-                            return parseHandleSaiStatusFailure(handle_status);
-                        }
+                        return false;
                     }
                     m_syncdTrapIds.erase(i);
                 }
@@ -882,15 +1123,9 @@ bool CoppOrch::processTrapGroupDel (string trap_group_name)
         if (it.second.trap_group_obj == m_trap_group_map[trap_group_name])
         {
             trap_ids_to_reset.push_back(it.first);
-            sai_status_t sai_status = sai_hostif_api->remove_hostif_trap(it.second.trap_obj);
-            if (sai_status != SAI_STATUS_SUCCESS)
+            if (!removeTrap(it.second.trap_obj, it.first))
             {
-                SWSS_LOG_ERROR("Failed to remove trap object %" PRId64 "", it.second.trap_obj);
-                task_process_status handle_status = handleSaiRemoveStatus(SAI_API_HOSTIF, sai_status);
-                if (handle_status != task_success)
-                {
-                    return parseHandleSaiStatusFailure(handle_status);
-                }
+                return false;
             }
         }
     }
@@ -950,8 +1185,8 @@ bool CoppOrch::getAttribsFromTrapGroup (vector<FieldValueTuple> &fv_tuple,
         {
             /* Mellanox platform doesn't support trap priority setting */
             /* Marvell platform doesn't support trap priority. */
-            char *platform = getenv("platform");
-            if (!platform || (!strstr(platform, MLNX_PLATFORM_SUBSTRING) && (!strstr(platform, MRVL_PLATFORM_SUBSTRING))))
+	    char *platform = getenv("platform");
+	    if (!platform || (!strstr(platform, MLNX_PLATFORM_SUBSTRING) && (!strstr(platform, MRVL_PRST_PLATFORM_SUBSTRING))))
             {
                 attr.id = SAI_HOSTIF_TRAP_ATTR_TRAP_PRIORITY,
                     attr.value.u32 = (uint32_t)stoul(fvValue(*i));
@@ -1034,16 +1269,20 @@ bool CoppOrch::getAttribsFromTrapGroup (vector<FieldValueTuple> &fv_tuple,
             genetlink_attribs.push_back(attr);
 
             attr.id = SAI_HOSTIF_ATTR_NAME;
+            auto size = sizeof(attr.value.chardata);
             strncpy(attr.value.chardata, fvValue(*i).c_str(),
-                    sizeof(attr.value.chardata));
+                    size - 1);
+            attr.value.chardata[size - 1] = '\0';
             genetlink_attribs.push_back(attr);
 
         }
         else if (fvField(*i) == copp_genetlink_mcgrp_name)
         {
             attr.id = SAI_HOSTIF_ATTR_GENETLINK_MCGRP_NAME;
+            auto size = sizeof(attr.value.chardata);
             strncpy(attr.value.chardata, fvValue(*i).c_str(),
-                    sizeof(attr.value.chardata));
+                    size - 1);
+            attr.value.chardata[size - 1] = '\0';
             genetlink_attribs.push_back(attr);
         }
         else
@@ -1058,12 +1297,14 @@ bool CoppOrch::getAttribsFromTrapGroup (vector<FieldValueTuple> &fv_tuple,
 bool CoppOrch::trapGroupUpdatePolicer (string trap_group_name,
                                        vector<sai_attribute_t> &policer_attribs)
 {
-    sai_object_id_t policer_id = getPolicer(trap_group_name);
-
     if (m_trap_group_map.find(trap_group_name) == m_trap_group_map.end())
     {
         return false;
     }
+
+    auto policer_object = getPolicer(trap_group_name);
+    auto policer_id = policer_object.policer_id;
+
     if (SAI_NULL_OBJECT_ID == policer_id)
     {
         SWSS_LOG_WARN("Creating policer for existing Trap group: %" PRIx64 " (name:%s).",
@@ -1079,6 +1320,35 @@ bool CoppOrch::trapGroupUpdatePolicer (string trap_group_name,
         for (sai_uint32_t ind = 0; ind < policer_attribs.size(); ind++)
         {
             auto policer_attr = policer_attribs[ind];
+            /*
+                Updating the CREATE_ONLY attributes of the policer will cause a crash
+                If modified, throw an error log and proceed with changeable attributes
+            */
+            if(policer_attr.id == SAI_POLICER_ATTR_METER_TYPE)
+            {
+                if (policer_object.meter != (sai_meter_type_t)policer_attr.value.s32)
+                {
+                    SWSS_LOG_ERROR("Trying to modify policer attribute: (meter), trap group: (%s)", trap_group_name.c_str());
+                }
+                continue;
+            }
+            else if(policer_attr.id == SAI_POLICER_ATTR_MODE)
+            {
+                if (policer_object.mode != (sai_policer_mode_t)policer_attr.value.s32)
+                {
+                    SWSS_LOG_ERROR("Trying to modify policer attribute: (mode), trap group: (%s)", trap_group_name.c_str());
+                }
+                continue;
+            }
+            else if(policer_attr.id == SAI_POLICER_ATTR_COLOR_SOURCE)
+            {
+                if (policer_object.color != (sai_policer_color_source_t)policer_attr.value.s32)
+                {
+                    SWSS_LOG_ERROR("Trying to modify policer attribute: (color), trap group: (%s)", trap_group_name.c_str());
+                }
+                continue;
+            }
+
             sai_status_t sai_status = sai_policer_api->set_policer_attribute(policer_id,
                                                                              &policer_attr);
             if (sai_status != SAI_STATUS_SUCCESS)
@@ -1095,4 +1365,163 @@ bool CoppOrch::trapGroupUpdatePolicer (string trap_group_name,
         }
     }
     return true;
+}
+
+void CoppOrch::initTrapRatePlugin()
+{
+    if (m_trap_rate_plugin_loaded)
+    {
+        return;
+    }
+
+    std::string trapRatePluginName = "trap_rates.lua";
+    std::string trapSha;
+    try
+    {
+        std::string trapLuaScript = swss::loadLuaScript(trapRatePluginName);
+        trapSha = swss::loadRedisScript(m_counter_db.get(), trapLuaScript);
+    }
+    catch (const runtime_error &e)
+    {
+        SWSS_LOG_ERROR("Trap flex counter groups were not set successfully: %s", e.what());
+    }
+
+    setFlexCounterGroupParameter(HOSTIF_TRAP_COUNTER_FLEX_COUNTER_GROUP,
+                                 "", // Do not touch poll interval
+                                 STATS_MODE_READ,
+                                 FLOW_COUNTER_PLUGIN_FIELD,
+                                 trapSha);
+    m_trap_rate_plugin_loaded = true;
+}
+
+bool CoppOrch::removeTrap(sai_object_id_t hostif_trap_id, sai_hostif_trap_type_t trap_type)
+{
+    unbindTrapCounter(hostif_trap_id);
+
+    sai_status_t sai_status = sai_hostif_api->remove_hostif_trap(hostif_trap_id);
+    if (sai_status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to remove trap object %" PRId64 "",
+                hostif_trap_id);
+        task_process_status handle_status = handleSaiRemoveStatus(SAI_API_HOSTIF, sai_status);
+        if (handle_status != task_success)
+        {
+            return parseHandleSaiStatusFailure(handle_status);
+        }
+    }
+    
+    updateTrapOperStatus(trap_type, "not-installed");
+
+    return true;
+}
+
+bool CoppOrch::bindTrapCounter(sai_object_id_t hostif_trap_id, sai_hostif_trap_type_t trap_type)
+{
+    auto flex_counters_orch = gDirectory.get<FlexCounterOrch*>();
+
+    if (!flex_counters_orch || !flex_counters_orch->getHostIfTrapCounterState())
+    {
+        return false;
+    }
+
+    if (m_trap_obj_name_map.count(hostif_trap_id) > 0)
+    {
+        return true;
+    }
+
+    initTrapRatePlugin();
+
+    // Create generic counter
+    sai_object_id_t counter_id;
+    if (!FlowCounterHandler::createGenericCounter(counter_id))
+    {
+        return false;
+    }
+
+    // Bind generic counter to trap
+    sai_attribute_t trap_attr;
+    trap_attr.id = SAI_HOSTIF_TRAP_ATTR_COUNTER_ID;
+    trap_attr.value.oid = counter_id;
+    sai_status_t sai_status = sai_hostif_api->set_hostif_trap_attribute(hostif_trap_id, &trap_attr);
+    if (sai_status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_WARN("Failed to bind trap %" PRId64 " to counter %" PRId64 "", hostif_trap_id, counter_id);
+        return false;
+    }
+
+    // Update COUNTERS_TRAP_NAME_MAP
+    auto trap_name = get_trap_name_by_type(trap_type);
+    vector<FieldValueTuple> nameMapFvs;
+    nameMapFvs.emplace_back(trap_name, sai_serialize_object_id(counter_id));
+    m_counter_table->set("", nameMapFvs);
+
+    auto was_empty = m_pendingAddToFlexCntr.empty();
+    m_pendingAddToFlexCntr[counter_id] = trap_name;
+
+    if (was_empty)
+    {
+        m_FlexCounterUpdTimer->start();
+    }
+
+    m_trap_obj_name_map.emplace(hostif_trap_id, trap_name);
+    return true;
+}
+
+void CoppOrch::unbindTrapCounter(sai_object_id_t hostif_trap_id)
+{
+    auto iter = m_trap_obj_name_map.find(hostif_trap_id);
+    if (iter == m_trap_obj_name_map.end())
+    {
+        return;
+    }
+
+    std::string counter_oid_str;
+    m_counter_table->hget("", iter->second, counter_oid_str);
+
+    // Clear FLEX_COUNTER table
+    sai_object_id_t counter_id;
+    sai_deserialize_object_id(counter_oid_str, counter_id);
+    auto update_iter = m_pendingAddToFlexCntr.find(counter_id);
+    if (update_iter == m_pendingAddToFlexCntr.end())
+    {
+        m_trap_counter_manager.clearCounterIdList(counter_id);
+    }
+    else
+    {
+        m_pendingAddToFlexCntr.erase(update_iter);
+    }
+
+    // Remove trap from COUNTERS_TRAP_NAME_MAP
+    m_counter_table->hdel("", iter->second);
+
+    // Unbind generic counter to trap
+    sai_attribute_t trap_attr;
+    trap_attr.id = SAI_HOSTIF_TRAP_ATTR_COUNTER_ID;
+    trap_attr.value.oid = SAI_NULL_OBJECT_ID;
+    sai_status_t sai_status = sai_hostif_api->set_hostif_trap_attribute(hostif_trap_id, &trap_attr);
+    if (sai_status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to unbind trap %" PRId64 " to counter %" PRId64 "", hostif_trap_id, counter_id);
+    }
+
+    // Remove generic counter
+    FlowCounterHandler::removeGenericCounter(counter_id);
+
+    m_trap_obj_name_map.erase(iter);
+}
+
+void CoppOrch::generateHostIfTrapCounterIdList()
+{
+    for (const auto &kv : m_syncdTrapIds)
+    {
+        bindTrapCounter(kv.second.trap_obj, kv.second.trap_type);
+    }
+}
+
+void CoppOrch::clearHostIfTrapCounterIdList()
+{
+    for (const auto &kv : m_syncdTrapIds)
+    {
+        unbindTrapCounter(kv.second.trap_obj);
+    }
 }

@@ -8,14 +8,16 @@
 #include "crmorch.h"
 #include "nhgorch.h"
 #include "directory.h"
+#include "cbf/cbfnhgorch.h"
 
 extern sai_object_id_t gVirtualRouterId;
 extern sai_object_id_t gSwitchId;
 
 extern CrmOrch *gCrmOrch;
 extern NhgOrch *gNhgOrch;
+extern CbfNhgOrch *gCbfNhgOrch;
 
-void RouteOrch::doLabelTask(Consumer& consumer)
+void RouteOrch::doLabelTask(ConsumerBase& consumer)
 {
     SWSS_LOG_ENTER();
 
@@ -253,8 +255,8 @@ void RouteOrch::doLabelTask(Consumer& consumer)
                 {
                     try
                     {
-                        const NextHopGroup& nh_group = gNhgOrch->getNhg(nhg_index);
-                        ctx.nhg = nh_group.getKey();
+                        const NhgBase& nh_group = getNhg(nhg_index);
+                        ctx.nhg = nh_group.getNhgKey();
                         ctx.using_temp_nhg = nh_group.isTemp();
                     }
                     catch (const std::out_of_range& e)
@@ -308,7 +310,7 @@ void RouteOrch::doLabelTask(Consumer& consumer)
 
                 // If already exhaust the nexthop groups, and there are pending removing routes in bulker,
                 // flush the bulker and possibly collect some released nexthop groups
-                if (gNhgOrch->getNhgCount() >= gNhgOrch->getMaxNhgCount() &&
+                if (m_nextHopGroupCount + NhgOrch::getSyncedNhgCount() >= m_maxNextHopGroupCount &&
                     gLabelRouteBulker.removing_entries_count() > 0)
                 {
                     break;
@@ -463,7 +465,7 @@ bool RouteOrch::addLabelRoute(LabelRouteBulkContext& ctx, const NextHopGroupKey 
     Label& label = ctx.label;
 
     /* next_hop_id indicates the next hop id or next hop group id of this route */
-    sai_object_id_t next_hop_id;
+    sai_object_id_t next_hop_id = SAI_NULL_OBJECT_ID;
     bool blackhole = false;
 
     if (m_syncdLabelRoutes.find(vrf_id) == m_syncdLabelRoutes.end())
@@ -478,7 +480,7 @@ bool RouteOrch::addLabelRoute(LabelRouteBulkContext& ctx, const NextHopGroupKey 
     {
         try
         {
-            const NextHopGroup& nhg = gNhgOrch->getNhg(ctx.nhg_index);
+            const NhgBase& nhg = getNhg(ctx.nhg_index);
             next_hop_id = nhg.getId();
         }
         catch(const std::out_of_range& e)
@@ -518,14 +520,22 @@ bool RouteOrch::addLabelRoute(LabelRouteBulkContext& ctx, const NextHopGroupKey 
                      m_neighOrch->isNeighborResolved(nexthop))
             {
                 /* since IP neighbor NH exists, neighbor is resolved, add MPLS NH */
-                m_neighOrch->addNextHop(nexthop);
-                next_hop_id = m_neighOrch->getNextHopId(nexthop);
+                NeighborContext ctx = NeighborContext(nexthop);
+                if (m_neighOrch->addNextHop(ctx))
+                {
+                    next_hop_id = m_neighOrch->getNextHopId(nexthop);
+                }
+                else
+                {
+                    return false;
+                }
             }
             /* IP neighbor is not yet resolved */
             else
             {
                 SWSS_LOG_INFO("Failed to get next hop %s for %u",
                         nextHops.to_string().c_str(), label);
+                m_neighOrch->resolveNeighbor(nexthop);
                 return false;
             }
         }
@@ -589,8 +599,12 @@ bool RouteOrch::addLabelRoute(LabelRouteBulkContext& ctx, const NextHopGroupKey 
      * in m_syncdLabelRoutes, then we need to update the route with a new next hop
      * (group) id. The old next hop (group) is then not used and the reference
      * count will decrease by 1.
+     *
+     * In case the entry is already pending removal in the bulk, it would be removed
+     * from m_syncdLabelRoutes during the bulk call. Therefore, such entries need to be
+     * re-created rather than set attribute.
      */
-    if (it_route == m_syncdLabelRoutes.at(vrf_id).end())
+    if (it_route == m_syncdLabelRoutes.at(vrf_id).end() || gLabelRouteBulker.bulk_entry_pending_removal(inseg_entry))
     {
         vector<sai_attribute_t> inseg_attrs;
         if (blackhole)
@@ -672,7 +686,7 @@ bool RouteOrch::addLabelRoutePost(const LabelRouteBulkContext& ctx, const NextHo
     /* Check that the next hop group is not owned by NhgOrch. */
     if (!ctx.nhg_index.empty())
     {
-        if (!gNhgOrch->hasNhg(ctx.nhg_index))
+        if (!gNhgOrch->hasNhg(ctx.nhg_index) && !gCbfNhgOrch->hasNhg(ctx.nhg_index))
         {
             SWSS_LOG_WARN("Failed to get next hop group with index %s", ctx.nhg_index.c_str());
             return false;
@@ -746,7 +760,7 @@ bool RouteOrch::addLabelRoutePost(const LabelRouteBulkContext& ctx, const NextHo
         }
         else
         {
-            gNhgOrch->incNhgRefCount(ctx.nhg_index);
+            incNhgRefCount(ctx.nhg_index);
         }
 
         SWSS_LOG_INFO("Post create label %u with next hop(s) %s",
@@ -794,10 +808,10 @@ bool RouteOrch::addLabelRoutePost(const LabelRouteBulkContext& ctx, const NextHo
                 m_bulkNhgReducedRefCnt.emplace(it_route->second.nhg_key, 0);
             }
         }
+        /* The next hop group is owned by (Cbf)NhgOrch. */
         else
         {
-            /* The next hop group is owned by NeighOrch. */
-            gNhgOrch->decNhgRefCount(it_route->second.nhg_index);
+            decNhgRefCount(it_route->second.nhg_index);
         }
 
         /* Increase the ref_count for the next hop (group) entry */
@@ -807,7 +821,7 @@ bool RouteOrch::addLabelRoutePost(const LabelRouteBulkContext& ctx, const NextHo
         }
         else
         {
-            gNhgOrch->incNhgRefCount(ctx.nhg_index);
+            incNhgRefCount(ctx.nhg_index);
         }
 
         if (blackhole)
@@ -929,7 +943,7 @@ bool RouteOrch::removeLabelRoutePost(const LabelRouteBulkContext& ctx)
     }
     else
     {
-        gNhgOrch->decNhgRefCount(it_route->second.nhg_index);
+        decNhgRefCount(it_route->second.nhg_index);
     }
 
     SWSS_LOG_INFO("Remove label route %u with next hop(s) %s",

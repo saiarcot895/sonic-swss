@@ -31,6 +31,7 @@
 #include "mclagsyncd/mclaglink.h"
 #include "mclagsyncd/mclag.h"
 #include <set>
+#include <unordered_set>
 #include <algorithm>
 #include "macaddress.h"
 #include <string>
@@ -188,8 +189,17 @@ void MclagLink::mclagsyncdFetchMclagInterfaceConfigFromConfigdb()
 
 void MclagLink::setPortIsolate(char *msg)
 {
-    char *platform = getenv("platform");
-    if ((NULL != platform) && (strstr(platform, BRCM_PLATFORM_SUBSTRING)))
+    static const unordered_set<string> supported {
+        BRCM_PLATFORM_SUBSTRING,
+        BFN_PLATFORM_SUBSTRING,
+        CTC_PLATFORM_SUBSTRING,
+        CLX_PLATFORM_SUBSTRING,
+        MRVL_PRST_PLATFORM_SUBSTRING,
+        MRVL_TL_PLATFORM_SUBSTRING
+    };
+
+    const char *platform = getenv("platform");
+    if (platform != nullptr && supported.find(string(platform)) != supported.end())
     {
         mclag_sub_option_hdr_t *op_hdr = NULL;
         string isolate_src_port;
@@ -334,7 +344,6 @@ void MclagLink::setPortIsolate(char *msg)
         acl_rule_attrs.push_back(ip_type_attr);
 
         string temp;
-        isolate_dst_port.insert(0, (const char*)cur, op_hdr->op_len);
         istringstream dst_ss(isolate_dst_port);
 
         isolate_dst_port.clear();
@@ -1739,7 +1748,7 @@ MclagLink::MclagLink(Select *select, int port) :
     m_server_up(false),
     m_select(select)
 {
-    struct sockaddr_in addr;
+    struct sockaddr_in addr = {};
     int true_val = 1;
 
     m_server_socket = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1760,7 +1769,6 @@ MclagLink::MclagLink(Select *select, int port) :
         throw system_error(errno, system_category());
     }
 
-    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short int)port);
     addr.sin_addr.s_addr = htonl(MCLAG_DEFAULT_IP);
@@ -1838,7 +1846,7 @@ MclagLink::~MclagLink()
 void MclagLink::accept()
 {
     struct sockaddr_in client_addr;
-    socklen_t client_len;
+    socklen_t client_len = sizeof(struct sockaddr_in);
 
     m_connection_socket = ::accept(m_server_socket, (struct sockaddr *)&client_addr,
             &client_len);

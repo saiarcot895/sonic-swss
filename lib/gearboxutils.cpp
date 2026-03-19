@@ -137,6 +137,9 @@ std::map<int, gearbox_phy_t> GearboxUtils::loadPhyMap(Table *gearboxTable)
         {
             gearbox_phy_t phy = {};
 
+            // default capability if absent
+            phy.macsec_supported = true;
+
             gearboxTable->get(k, ovalues);
             for (auto &val : ovalues)
             {
@@ -192,6 +195,10 @@ std::map<int, gearbox_phy_t> GearboxUtils::loadPhyMap(Table *gearboxTable)
                 else if (val.first == "macsec_ipg")
                 {
                     phy.macsec_ipg = std::stoi(val.second);
+                }
+                else if (val.first == "macsec_supported")
+                {
+                    phy.macsec_supported = (val.second == "true");
                 }
             }
             gearboxPhyMap[phy.phy_id] = phy;
@@ -265,6 +272,11 @@ std::map<int, gearbox_interface_t> GearboxUtils::loadInterfaceMap(Table *gearbox
                             ss.ignore();
                         }
                     }
+                }
+                else if (tx_fir_strings.find(val.first) != tx_fir_strings.end())
+                {
+                    SWSS_LOG_DEBUG("Parsed key:%s, val:%s", val.first.c_str(), val.second.c_str());
+                    interface.tx_firs[val.first] = val.second;
                 }
             }
             gearboxInterfaceMap[interface.index] = interface;

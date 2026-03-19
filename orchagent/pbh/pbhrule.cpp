@@ -3,7 +3,7 @@
 #include "pbhrule.h"
 
 AclRulePbh::AclRulePbh(AclOrch *pAclOrch, string rule, string table, bool createCounter) :
-    AclRule(pAclOrch, rule, table, ACL_TABLE_PBH, createCounter)
+    AclRule(pAclOrch, rule, table, createCounter)
 {
 }
 
@@ -11,15 +11,7 @@ bool AclRulePbh::validateAddPriority(const sai_uint32_t &value)
 {
     SWSS_LOG_ENTER();
 
-    if ((value < m_minPriority) || (value > m_maxPriority))
-    {
-        SWSS_LOG_ERROR("Failed to validate priority: invalid value %d", value);
-        return false;
-    }
-
-    m_priority = value;
-
-    return true;
+    return setPriority(value);
 }
 
 bool AclRulePbh::validateAddMatch(const sai_attribute_t &attr)
@@ -52,9 +44,7 @@ bool AclRulePbh::validateAddMatch(const sai_attribute_t &attr)
         return false;
     }
 
-    m_matches[attrId] = attr.value;
-
-    return true;
+    return setMatch(attrId, attr.value.aclfield);
 }
 
 bool AclRulePbh::validateAddAction(const sai_attribute_t &attr)
@@ -83,15 +73,7 @@ bool AclRulePbh::validateAddAction(const sai_attribute_t &attr)
         return false;
     }
 
-    if (!AclRule::isActionSupported(attrId))
-    {
-        SWSS_LOG_ERROR("Action %s is not supported by ASIC", attrName.c_str());
-        return false;
-    }
-
-    m_actions[attrId] = attr.value;
-
-    return true;
+    return setAction(attrId, attr.value.aclaction);
 }
 
 bool AclRulePbh::validate()
@@ -107,7 +89,59 @@ bool AclRulePbh::validate()
     return true;
 }
 
-void AclRulePbh::update(SubjectType, void *)
+void AclRulePbh::onUpdate(SubjectType, void *)
 {
     // Do nothing
+}
+
+bool AclRulePbh::validateAddAction(string attr_name, string attr_value)
+{
+    SWSS_LOG_THROW("This API should not be used on PbhRule");
+}
+
+bool AclRulePbh::disableAction()
+{
+    const auto &cit1 = m_actions.find(SAI_ACL_ENTRY_ATTR_ACTION_SET_ECMP_HASH_ID);
+    if (cit1 != m_actions.cend())
+    {
+        const auto &attr1 = cit1->second.getSaiAttr();
+        if (attr1.value.aclaction.enable)
+        {
+            sai_attribute_t attr;
+
+            attr.id = attr1.id;
+            attr.value.aclaction.enable = false;
+            attr.value.aclaction.parameter.oid = SAI_NULL_OBJECT_ID;
+
+            if (!setAttribute(attr))
+            {
+                return false;
+            }
+
+            m_actions.erase(cit1);
+        }
+    }
+
+    const auto &cit2 = m_actions.find(SAI_ACL_ENTRY_ATTR_ACTION_SET_LAG_HASH_ID);
+    if (cit2 != m_actions.cend())
+    {
+        const auto &attr2 = cit2->second.getSaiAttr();
+        if (attr2.value.aclaction.enable)
+        {
+            sai_attribute_t attr;
+
+            attr.id = attr2.id;
+            attr.value.aclaction.enable = false;
+            attr.value.aclaction.parameter.oid = SAI_NULL_OBJECT_ID;
+
+            if (!setAttribute(attr))
+            {
+                return false;
+            }
+
+            m_actions.erase(cit2);
+        }
+    }
+
+    return true;
 }

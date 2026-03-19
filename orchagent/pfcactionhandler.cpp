@@ -25,6 +25,7 @@
 
 extern sai_object_id_t gSwitchId;
 extern PortsOrch *gPortsOrch;
+extern SwitchOrch *gSwitchOrch;
 extern AclOrch * gAclOrch;
 extern sai_port_api_t *sai_port_api;
 extern sai_queue_api_t *sai_queue_api;
@@ -221,7 +222,7 @@ void PfcWdActionHandler::updateWdCounters(const string& queueIdStr, const PfcWdQ
 
 PfcWdSaiDlrInitHandler::PfcWdSaiDlrInitHandler(sai_object_id_t port, sai_object_id_t queue,
                                                uint8_t queueId, shared_ptr<Table> countersTable):
-    PfcWdActionHandler(port, queue, queueId, countersTable)
+    PfcWdZeroBufferHandler(port, queue, queueId, countersTable)
 {
     SWSS_LOG_ENTER();
 
@@ -262,37 +263,47 @@ PfcWdSaiDlrInitHandler::~PfcWdSaiDlrInitHandler(void)
     }
 }
 
-bool PfcWdSaiDlrInitHandler::getHwCounters(PfcWdHwStats& counters)
+PfcWdDlrHandler::PfcWdDlrHandler(sai_object_id_t port, sai_object_id_t queue,
+                                               uint8_t queueId, shared_ptr<Table> countersTable):
+    PfcWdLossyHandler(port, queue, queueId, countersTable)
 {
     SWSS_LOG_ENTER();
 
-    static const vector<sai_stat_id_t> queueStatIds =
-    {
-        SAI_QUEUE_STAT_PACKETS,
-        SAI_QUEUE_STAT_DROPPED_PACKETS,
-    };
+    sai_attribute_t attr;
+    attr.id = SAI_QUEUE_ATTR_PFC_DLR_INIT;
+    attr.value.booldata = true;
 
-    vector<uint64_t> queueStats;
-    queueStats.resize(queueStatIds.size());
-
-    sai_status_t status = sai_queue_api->get_queue_stats(
-            getQueue(),
-            static_cast<uint32_t>(queueStatIds.size()),
-            queueStatIds.data(),
-            queueStats.data());
-
+    // Set DLR init to true to start PFC deadlock recovery
+    sai_status_t status = sai_queue_api->set_queue_attribute(queue, &attr);
     if (status != SAI_STATUS_SUCCESS)
     {
-        SWSS_LOG_ERROR("Failed to fetch queue 0x%" PRIx64 " stats: %d", getQueue(), status);
-        return false;
+        SWSS_LOG_ERROR("Failed to set PFC DLR INIT on port 0x%" PRIx64 " queue 0x%" PRIx64
+                       " queueId %d : %d",
+                       port, queue, queueId, status);
+        return;
     }
+}
 
-    counters.txPkt = queueStats[0];
-    counters.txDropPkt = queueStats[1];
-    counters.rxPkt = 0;
-    counters.rxDropPkt = 0;
+PfcWdDlrHandler::~PfcWdDlrHandler(void)
+{
+    SWSS_LOG_ENTER();
 
-    return true;
+    sai_object_id_t port = getPort();
+    sai_object_id_t queue = getQueue();
+    uint8_t queueId = getQueueId();
+
+    sai_attribute_t attr;
+    attr.id = SAI_QUEUE_ATTR_PFC_DLR_INIT;
+    attr.value.booldata = false;
+
+    // Set DLR init to false to stop PFC deadlock recovery
+    sai_status_t status = sai_queue_api->set_queue_attribute(getQueue(), &attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to clear PFC DLR INIT on port 0x%" PRIx64 " queue 0x%" PRIx64
+                       " queueId %d : %d", port, queue, queueId, status);
+        return;
+    }
 }
 
 PfcWdAclHandler::PfcWdAclHandler(sai_object_id_t port, sai_object_id_t queue,
@@ -301,20 +312,20 @@ PfcWdAclHandler::PfcWdAclHandler(sai_object_id_t port, sai_object_id_t queue,
 {
     SWSS_LOG_ENTER();
 
-    acl_table_type_t table_type;
+    string table_type;
 
     string queuestr = to_string(queueId);
     m_strRule = "Rule_PfcWdAclHandler_" + queuestr;
 
     // Ingress table/rule creation
-    table_type = ACL_TABLE_DROP;
+    table_type = TABLE_TYPE_DROP;
     m_strIngressTable = INGRESS_TABLE_DROP;
     auto found = m_aclTables.find(m_strIngressTable);
     if (found == m_aclTables.end())
     {
         // First time of handling PFC for this queue, create ACL table, and bind
         createPfcAclTable(port, m_strIngressTable, true);
-        shared_ptr<AclRulePfcwd> newRule = make_shared<AclRulePfcwd>(gAclOrch, m_strRule, m_strIngressTable, table_type);
+        shared_ptr<AclRulePacket> newRule = make_shared<AclRulePacket>(gAclOrch, m_strRule, m_strIngressTable);
         createPfcAclRule(newRule, queueId, m_strIngressTable, port);
     }
     else
@@ -322,7 +333,7 @@ PfcWdAclHandler::PfcWdAclHandler(sai_object_id_t port, sai_object_id_t queue,
         AclRule* rule = gAclOrch->getAclRule(m_strIngressTable, m_strRule);
         if (rule == nullptr)
         {
-            shared_ptr<AclRulePfcwd> newRule = make_shared<AclRulePfcwd>(gAclOrch, m_strRule, m_strIngressTable, table_type);
+            shared_ptr<AclRulePacket> newRule = make_shared<AclRulePacket>(gAclOrch, m_strRule, m_strIngressTable);
             createPfcAclRule(newRule, queueId, m_strIngressTable, port);
         } 
         else 
@@ -332,20 +343,59 @@ PfcWdAclHandler::PfcWdAclHandler(sai_object_id_t port, sai_object_id_t queue,
     }
 
     // Egress table/rule creation
-    table_type = ACL_TABLE_PFCWD;
-    m_strEgressTable = "EgressTable_PfcWdAclHandler_" + queuestr;
-    found = m_aclTables.find(m_strEgressTable);
-    if (found == m_aclTables.end())
+    table_type = TABLE_TYPE_PFCWD;
+
+    // Use shared egress acl table for BRCM DNX platform.
+    string platform = getenv("platform") ? getenv("platform") : "";
+    string sub_platform = getenv("sub_platform") ? getenv("sub_platform") : "";
+    shared_egress_acl_table = (platform == BRCM_PLATFORM_SUBSTRING &&
+                               sub_platform == BRCM_DNX_PLATFORM_SUBSTRING);
+
+    if (shared_egress_acl_table)
     {
-        // First time of handling PFC for this queue, create ACL table, and bind
-        createPfcAclTable(port, m_strEgressTable, false);
-        shared_ptr<AclRulePfcwd> newRule = make_shared<AclRulePfcwd>(gAclOrch, m_strRule, m_strEgressTable, table_type);
-        createPfcAclRule(newRule, queueId, m_strEgressTable, port);
+        Port p;
+        if (!gPortsOrch->getPort(port, p))
+        {
+            SWSS_LOG_ERROR("Failed to get port structure from port oid 0x%" PRIx64, port);
+            return;
+        }
+        m_strEgressRule = "Egress_Rule_PfcWdAclHandler_" + p.m_alias + "_" + queuestr;
+        m_strEgressTable = "EgressTable_PfcWdAclHandler";
+        found = m_aclTables.find(m_strEgressTable);
+        if (found == m_aclTables.end())
+        {
+            // First time of handling PFC, create ACL table and also ACL rule.
+            createPfcAclTable(port, m_strEgressTable, false);
+            shared_ptr<AclRulePacket> newRule = make_shared<AclRulePacket>(gAclOrch, m_strEgressRule, m_strEgressTable);
+            createPfcAclRule(newRule, queueId, m_strEgressTable, port);
+        }
+        else
+        {
+            // ACL table already exists. Add ACL rule if needed.
+            AclRule* rule = gAclOrch->getAclRule(m_strEgressTable, m_strEgressRule);
+            if (rule == nullptr)
+            {
+                shared_ptr<AclRulePacket> newRule = make_shared<AclRulePacket>(gAclOrch, m_strEgressRule, m_strEgressTable);
+                createPfcAclRule(newRule, queueId, m_strEgressTable, port);
+            }
+        }
     }
     else
     {
-        // Otherwise just bind ACL table with the port
-        found->second.bind(port);
+        m_strEgressTable = "EgressTable_PfcWdAclHandler_" + queuestr;
+        found = m_aclTables.find(m_strEgressTable);
+        if (found == m_aclTables.end())
+        {
+            // First time of handling PFC for this queue, create ACL table, and bind
+            createPfcAclTable(port, m_strEgressTable, false);
+            shared_ptr<AclRulePacket> newRule = make_shared<AclRulePacket>(gAclOrch, m_strRule, m_strEgressTable);
+            createPfcAclRule(newRule, queueId, m_strEgressTable, port);
+        }
+        else
+        {
+            // Otherwise just bind ACL table with the port
+            found->second.bind(port);
+        }
     }
 }
 
@@ -371,8 +421,20 @@ PfcWdAclHandler::~PfcWdAclHandler(void)
         gAclOrch->updateAclRule(m_strIngressTable, m_strRule, MATCH_IN_PORTS, &port, RULE_OPER_DELETE);
     } 
 
-    auto found = m_aclTables.find(m_strEgressTable);
-    found->second.unbind(port);
+    if (shared_egress_acl_table)
+    {
+        rule = gAclOrch->getAclRule(m_strEgressTable, m_strEgressRule);
+        if (rule == nullptr)
+        {
+            SWSS_LOG_THROW("Egress ACL Rule does not exist for rule %s", m_strEgressRule.c_str());
+        }
+        gAclOrch->removeAclRule(m_strEgressTable, m_strEgressRule);
+    }
+    else
+    {
+        auto found = m_aclTables.find(m_strEgressTable);
+        found->second.unbind(port);
+    }
 }
 
 void PfcWdAclHandler::clear()
@@ -392,7 +454,7 @@ void PfcWdAclHandler::createPfcAclTable(sai_object_id_t port, string strTable, b
 
     auto inserted = m_aclTables.emplace(piecewise_construct,
         std::forward_as_tuple(strTable),
-        std::forward_as_tuple());
+        std::forward_as_tuple(gAclOrch, strTable));
 
     assert(inserted.second);
 
@@ -407,24 +469,31 @@ void PfcWdAclHandler::createPfcAclTable(sai_object_id_t port, string strTable, b
         return;
     }
 
-    aclTable.link(port);
-    aclTable.id = strTable;
+    // Link port only for ingress ACL table or unshared egress ACL table.
+    if (ingress || !shared_egress_acl_table)
+    {
+        aclTable.link(port);
+    }
 
     if (ingress) 
     {
-        aclTable.type = ACL_TABLE_DROP;
+        auto dropType = gAclOrch->getAclTableType(TABLE_TYPE_DROP);
+        assert(dropType);
+        aclTable.validateAddType(*dropType);
         aclTable.stage = ACL_STAGE_INGRESS;
     } 
     else 
     {
-        aclTable.type = ACL_TABLE_PFCWD;
+        auto pfcwdType = gAclOrch->getAclTableType(TABLE_TYPE_PFCWD);
+        assert(pfcwdType);
+        aclTable.validateAddType(*pfcwdType);
         aclTable.stage = ACL_STAGE_EGRESS;
     }
     
     gAclOrch->addAclTable(aclTable);
 }
 
-void PfcWdAclHandler::createPfcAclRule(shared_ptr<AclRulePfcwd> rule, uint8_t queueId, string strTable, sai_object_id_t portOid)
+void PfcWdAclHandler::createPfcAclRule(shared_ptr<AclRulePacket> rule, uint8_t queueId, string strTable, sai_object_id_t portOid)
 {
     SWSS_LOG_ENTER();
 
@@ -438,18 +507,24 @@ void PfcWdAclHandler::createPfcAclRule(shared_ptr<AclRulePfcwd> rule, uint8_t qu
     attr_value = to_string(queueId);
     rule->validateAddMatch(attr_name, attr_value);
 
-    // Add MATCH_IN_PORTS as match criteria for ingress table
-    if (strTable == INGRESS_TABLE_DROP) 
+    // Add MATCH_IN_PORTS as match criteria for ingress table and MATCH_OUT_PORT as match creiteria for shared egress table.
+    if (strTable == INGRESS_TABLE_DROP || shared_egress_acl_table)
     {
         Port p;
-        attr_name = MATCH_IN_PORTS;
-
+        if (strTable == INGRESS_TABLE_DROP) 
+        {
+            attr_name = MATCH_IN_PORTS;
+        }
+        else if (shared_egress_acl_table) {
+            attr_name = MATCH_OUT_PORT;
+        }
+    
         if (!gPortsOrch->getPort(portOid, p))
         {
             SWSS_LOG_ERROR("Failed to get port structure from port oid 0x%" PRIx64, portOid);
             return;
         }
-
+    
         attr_value = p.m_alias;
         rule->validateAddMatch(attr_name, attr_value);
     }
@@ -469,6 +544,14 @@ PfcWdLossyHandler::PfcWdLossyHandler(sai_object_id_t port, sai_object_id_t queue
 {
     SWSS_LOG_ENTER();
 
+    string platform = getenv("platform") ? getenv("platform") : "";
+    if (platform == CISCO_8000_PLATFORM_SUBSTRING || ((platform == BRCM_PLATFORM_SUBSTRING) && (gSwitchOrch->checkPfcDlrInitEnable())))
+    {
+        SWSS_LOG_DEBUG("Skipping in constructor PfcWdLossyHandler for platform %s on port 0x%" PRIx64,
+                       platform.c_str(), port);
+        return;
+    }
+
     uint8_t pfcMask = 0;
 
     if (!gPortsOrch->getPortPfc(port, &pfcMask))
@@ -487,6 +570,14 @@ PfcWdLossyHandler::PfcWdLossyHandler(sai_object_id_t port, sai_object_id_t queue
 PfcWdLossyHandler::~PfcWdLossyHandler(void)
 {
     SWSS_LOG_ENTER();
+
+    string platform = getenv("platform") ? getenv("platform") : "";
+    if (platform == CISCO_8000_PLATFORM_SUBSTRING || ((platform == BRCM_PLATFORM_SUBSTRING) && (gSwitchOrch->checkPfcDlrInitEnable())))
+    {
+        SWSS_LOG_DEBUG("Skipping in destructor PfcWdLossyHandler for platform %s on port 0x%" PRIx64,
+                       platform.c_str(), getPort());
+        return;
+    }
 
     uint8_t pfcMask = 0;
 
@@ -579,7 +670,7 @@ PfcWdZeroBufferHandler::PfcWdZeroBufferHandler(sai_object_id_t port,
         return;
     }
 
-    setPriorityGroupAndQueueLockFlag(portInstance, true);
+    setQueueLockFlag(portInstance, true);
 
     sai_attribute_t attr;
     attr.id = SAI_QUEUE_ATTR_BUFFER_PROFILE_ID;
@@ -595,7 +686,7 @@ PfcWdZeroBufferHandler::PfcWdZeroBufferHandler(sai_object_id_t port,
     sai_object_id_t oldQueueProfileId = attr.value.oid;
 
     attr.id = SAI_QUEUE_ATTR_BUFFER_PROFILE_ID;
-    attr.value.oid = ZeroBufferProfile::getZeroBufferProfile(false);
+    attr.value.oid = ZeroBufferProfile::getZeroBufferProfile();
 
     // Set our zero buffer profile
     status = sai_queue_api->set_queue_attribute(queue, &attr);
@@ -607,35 +698,6 @@ PfcWdZeroBufferHandler::PfcWdZeroBufferHandler(sai_object_id_t port,
 
     // Save original buffer profile
     m_originalQueueBufferProfile = oldQueueProfileId;
-
-    // Get PG
-    sai_object_id_t pg = portInstance.m_priority_group_ids[static_cast <size_t> (queueId)];
-
-    attr.id = SAI_INGRESS_PRIORITY_GROUP_ATTR_BUFFER_PROFILE;
-
-    // Get PG's buffer profile
-    status = sai_buffer_api->get_ingress_priority_group_attribute(pg, 1, &attr);
-    if (status != SAI_STATUS_SUCCESS)
-    {
-        SWSS_LOG_ERROR("Failed to get buffer profile ID on PG 0x%" PRIx64 ": %d", pg, status);
-        return;
-    }
-
-    // Set zero profile to PG
-    sai_object_id_t oldPgProfileId = attr.value.oid;
-
-    attr.id = SAI_INGRESS_PRIORITY_GROUP_ATTR_BUFFER_PROFILE;
-    attr.value.oid = ZeroBufferProfile::getZeroBufferProfile(true);
-
-    status = sai_buffer_api->set_ingress_priority_group_attribute(pg, &attr);
-    if (status != SAI_STATUS_SUCCESS)
-    {
-        SWSS_LOG_ERROR("Failed to set buffer profile ID on pg 0x%" PRIx64 ": %d", pg, status);
-        return;
-    }
-
-    // Save original buffer profile
-    m_originalPgBufferProfile = oldPgProfileId;
 }
 
 PfcWdZeroBufferHandler::~PfcWdZeroBufferHandler(void)
@@ -661,41 +723,12 @@ PfcWdZeroBufferHandler::~PfcWdZeroBufferHandler(void)
         return;
     }
 
-    auto idx = size_t(getQueueId());
-    sai_object_id_t pg = portInstance.m_priority_group_ids[idx];
-    sai_object_id_t pending_profile_id = portInstance.m_priority_group_pending_profile[idx];
-
-    attr.id = SAI_INGRESS_PRIORITY_GROUP_ATTR_BUFFER_PROFILE;
-
-    if (pending_profile_id != SAI_NULL_OBJECT_ID)
-    {
-        attr.value.oid = pending_profile_id;
-        SWSS_LOG_NOTICE("Priority group %zd on port %s has been restored to pending profile 0x%" PRIx64,
-                        idx, portInstance.m_alias.c_str(), pending_profile_id);
-        portInstance.m_priority_group_pending_profile[idx] = SAI_NULL_OBJECT_ID;
-    }
-    else
-    {
-        attr.value.oid = m_originalPgBufferProfile;
-        SWSS_LOG_NOTICE("Priority group %zd on port %s has been restored to original profile 0x%" PRIx64,
-                        idx, portInstance.m_alias.c_str(), m_originalPgBufferProfile);
-    }
-
-    // Set our zero buffer profile
-    status = sai_buffer_api->set_ingress_priority_group_attribute(pg, &attr);
-    if (status != SAI_STATUS_SUCCESS)
-    {
-        SWSS_LOG_ERROR("Failed to set buffer profile ID on queue 0x%" PRIx64 ": %d", getQueue(), status);
-        return;
-    }
-
-    setPriorityGroupAndQueueLockFlag(portInstance, false);
+    setQueueLockFlag(portInstance, false);
 }
 
-void PfcWdZeroBufferHandler::setPriorityGroupAndQueueLockFlag(Port& port, bool isLocked) const
+void PfcWdZeroBufferHandler::setQueueLockFlag(Port& port, bool isLocked) const
 {
-    // set lock bits on PG and queue
-    port.m_priority_group_lock[static_cast<size_t>(getQueueId())] = isLocked;
+    // set lock bits on queue
     for (size_t i = 0; i < port.m_queue_ids.size(); ++i)
     {
         if (port.m_queue_ids[i] == getQueue())
@@ -715,9 +748,8 @@ PfcWdZeroBufferHandler::ZeroBufferProfile::~ZeroBufferProfile(void)
 {
     SWSS_LOG_ENTER();
 
-    // Destroy ingress and egress profiles and pools
-    destroyZeroBufferProfile(true);
-    destroyZeroBufferProfile(false);
+    // Destroy egress profiles and pools
+    destroyZeroBufferProfile();
 }
 
 PfcWdZeroBufferHandler::ZeroBufferProfile &PfcWdZeroBufferHandler::ZeroBufferProfile::getInstance(void)
@@ -729,24 +761,25 @@ PfcWdZeroBufferHandler::ZeroBufferProfile &PfcWdZeroBufferHandler::ZeroBufferPro
     return instance;
 }
 
-sai_object_id_t PfcWdZeroBufferHandler::ZeroBufferProfile::getZeroBufferProfile(bool ingress)
+sai_object_id_t PfcWdZeroBufferHandler::ZeroBufferProfile::getZeroBufferProfile()
 {
     SWSS_LOG_ENTER();
 
-    if (getInstance().getProfile(ingress) == SAI_NULL_OBJECT_ID)
+    if (getInstance().getProfile() == SAI_NULL_OBJECT_ID)
     {
-        getInstance().createZeroBufferProfile(ingress);
+        getInstance().createZeroBufferProfile();
     }
 
-    return getInstance().getProfile(ingress);
+    return getInstance().getProfile();
 }
 
-void PfcWdZeroBufferHandler::ZeroBufferProfile::createZeroBufferProfile(bool ingress)
+void PfcWdZeroBufferHandler::ZeroBufferProfile::createZeroBufferProfile()
 {
     SWSS_LOG_ENTER();
 
     sai_attribute_t attr;
     vector<sai_attribute_t> attribs;
+    sai_status_t status;
 
     // Create zero pool
     attr.id = SAI_BUFFER_POOL_ATTR_SIZE;
@@ -754,18 +787,18 @@ void PfcWdZeroBufferHandler::ZeroBufferProfile::createZeroBufferProfile(bool ing
     attribs.push_back(attr);
 
     attr.id = SAI_BUFFER_POOL_ATTR_TYPE;
-    attr.value.u32 = ingress ? SAI_BUFFER_POOL_TYPE_INGRESS : SAI_BUFFER_POOL_TYPE_EGRESS;
+    attr.value.u32 = SAI_BUFFER_POOL_TYPE_EGRESS;
     attribs.push_back(attr);
 
     attr.id = SAI_BUFFER_POOL_ATTR_THRESHOLD_MODE;
     attr.value.u32 = SAI_BUFFER_POOL_THRESHOLD_MODE_DYNAMIC;
     attribs.push_back(attr);
 
-    sai_status_t status = sai_buffer_api->create_buffer_pool(
-            &getPool(ingress),
-            gSwitchId,
-            static_cast<uint32_t>(attribs.size()),
-            attribs.data());
+    status = sai_buffer_api->create_buffer_pool(
+        &getPool(),
+        gSwitchId,
+        static_cast<uint32_t>(attribs.size()),
+        attribs.data());
     if (status != SAI_STATUS_SUCCESS)
     {
         SWSS_LOG_ERROR("Failed to create dynamic zero buffer pool for PFC WD: %d", status);
@@ -776,7 +809,7 @@ void PfcWdZeroBufferHandler::ZeroBufferProfile::createZeroBufferProfile(bool ing
     attribs.clear();
 
     attr.id = SAI_BUFFER_PROFILE_ATTR_POOL_ID;
-    attr.value.oid = getPool(ingress);
+    attr.value.oid = getPool();
     attribs.push_back(attr);
 
     attr.id = SAI_BUFFER_PROFILE_ATTR_THRESHOLD_MODE;
@@ -788,11 +821,11 @@ void PfcWdZeroBufferHandler::ZeroBufferProfile::createZeroBufferProfile(bool ing
     attribs.push_back(attr);
 
     attr.id = SAI_BUFFER_PROFILE_ATTR_SHARED_DYNAMIC_TH;
-    attr.value.s8 = -8; // ALPHA_0
+    attr.value.s8 = -8;
     attribs.push_back(attr);
 
     status = sai_buffer_api->create_buffer_profile(
-            &getProfile(ingress),
+            &getProfile(),
             gSwitchId,
             static_cast<uint32_t>(attribs.size()),
             attribs.data());
@@ -803,18 +836,18 @@ void PfcWdZeroBufferHandler::ZeroBufferProfile::createZeroBufferProfile(bool ing
     }
 }
 
-void PfcWdZeroBufferHandler::ZeroBufferProfile::destroyZeroBufferProfile(bool ingress)
+void PfcWdZeroBufferHandler::ZeroBufferProfile::destroyZeroBufferProfile()
 {
     SWSS_LOG_ENTER();
 
-    sai_status_t status = sai_buffer_api->remove_buffer_profile(getProfile(ingress));
+    sai_status_t status = sai_buffer_api->remove_buffer_profile(getProfile());
     if (status != SAI_STATUS_SUCCESS)
     {
         SWSS_LOG_ERROR("Failed to remove static zero buffer profile for PFC WD: %d", status);
         return;
     }
 
-    status = sai_buffer_api->remove_buffer_pool(getPool(ingress));
+    status = sai_buffer_api->remove_buffer_pool(getPool());
     if (status != SAI_STATUS_SUCCESS)
     {
         SWSS_LOG_ERROR("Failed to remove static zero buffer pool for PFC WD: %d", status);

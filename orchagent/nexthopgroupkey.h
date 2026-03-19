@@ -2,6 +2,7 @@
 #define SWSS_NEXTHOPGROUPKEY_H
 
 #include "nexthopkey.h"
+#include <boost/functional/hash.hpp>
 
 class NextHopGroupKey
 {
@@ -12,6 +13,8 @@ public:
     NextHopGroupKey(const std::string &nexthops)
     {
         m_overlay_nexthops = false;
+        m_srv6_nexthops = false;
+        m_srv6_vpn = false;
         auto nhv = tokenize(nexthops, NHG_DELIMITER);
         for (const auto &nh : nhv)
         {
@@ -20,20 +23,43 @@ public:
     }
 
     /* ip_string|if_alias|vni|router_mac separated by ',' */
-    NextHopGroupKey(const std::string &nexthops, bool overlay_nh)
+    NextHopGroupKey(const std::string &nexthops, bool overlay_nh, bool srv6_nh = false)
     {
-        m_overlay_nexthops = true;
-        auto nhv = tokenize(nexthops, NHG_DELIMITER);
-        for (const auto &nh_str : nhv)
+        if (overlay_nh)
         {
-            auto nh = NextHopKey(nh_str, overlay_nh);
-            m_nexthops.insert(nh);
+            m_overlay_nexthops = true;
+            m_srv6_nexthops = false;
+            m_srv6_vpn = false;
+            auto nhv = tokenize(nexthops, NHG_DELIMITER);
+            for (const auto &nh_str : nhv)
+            {
+                auto nh = NextHopKey(nh_str, overlay_nh, srv6_nh);
+                m_nexthops.insert(nh);
+            }
+        }
+        else if (srv6_nh)
+        {
+            m_overlay_nexthops = false;
+            m_srv6_nexthops = true;
+            m_srv6_vpn = false;
+            auto nhv = tokenize(nexthops, NHG_DELIMITER);
+            for (const auto &nh_str : nhv)
+            {
+                auto nh = NextHopKey(nh_str, overlay_nh, srv6_nh);
+                m_nexthops.insert(nh);
+                if (nh.isSrv6Vpn())
+                {
+                    m_srv6_vpn = true;
+                }
+            }
         }
     }
 
     NextHopGroupKey(const std::string &nexthops, const std::string &weights)
     {
         m_overlay_nexthops = false;
+        m_srv6_nexthops = false;
+        m_srv6_vpn = false;
         std::vector<std::string> nhv = tokenize(nexthops, NHG_DELIMITER);
         std::vector<std::string> wtv = tokenize(weights, NHG_DELIMITER);
         bool set_weight = wtv.size() == nhv.size();
@@ -184,8 +210,8 @@ public:
             {
                 nhs_str += NHG_DELIMITER;
             }
-            if (m_overlay_nexthops) {
-                nhs_str += it->to_string(m_overlay_nexthops);
+            if (m_overlay_nexthops || m_srv6_nexthops) {
+                nhs_str += it->to_string(m_overlay_nexthops, m_srv6_nexthops);
             } else {
                 nhs_str += it->to_string();
             }
@@ -199,6 +225,16 @@ public:
         return m_overlay_nexthops;
     }
 
+    inline bool is_srv6_nexthop() const
+    {
+        return m_srv6_nexthops;
+    }
+
+    inline bool is_srv6_vpn() const
+    {
+        return m_srv6_vpn;
+    }
+
     void clear()
     {
         m_nexthops.clear();
@@ -206,7 +242,22 @@ public:
 
 private:
     std::set<NextHopKey> m_nexthops;
-    bool m_overlay_nexthops;
+    bool m_overlay_nexthops = false;
+    bool m_srv6_nexthops = false;
+    bool m_srv6_vpn = false;
+
+    // Support std::unordered_map
+    template <typename T>
+    friend class std::hash; 
 };
+
+namespace std {
+    template <>
+    struct hash<NextHopGroupKey> {
+        size_t operator()(const NextHopGroupKey& obj) const {
+            return boost::hash_range(obj.m_nexthops.begin(), obj.m_nexthops.end());
+        }
+    };
+}
 
 #endif /* SWSS_NEXTHOPGROUPKEY_H */

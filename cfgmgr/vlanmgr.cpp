@@ -7,6 +7,7 @@
 #include "tokenize.h"
 #include "shellcmd.h"
 #include "warm_restart.h"
+#include <swss/redisutility.h>
 
 using namespace std;
 using namespace swss;
@@ -20,8 +21,9 @@ using namespace swss;
 
 extern MacAddress gMacAddress;
 
-VlanMgr::VlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, const vector<string> &tableNames) :
-        Orch(cfgDb, tableNames),
+VlanMgr::VlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, const vector<string> &tableNames,
+        const vector<string> &stateTableNames) :
+        Orch(cfgDb, stateDb, tableNames, stateTableNames),
         m_cfgVlanTable(cfgDb, CFG_VLAN_TABLE_NAME),
         m_cfgVlanMemberTable(cfgDb, CFG_VLAN_MEMBER_TABLE_NAME),
         m_statePortTable(stateDb, STATE_PORT_TABLE_NAME),
@@ -30,6 +32,8 @@ VlanMgr::VlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, c
         m_stateVlanMemberTable(stateDb, STATE_VLAN_MEMBER_TABLE_NAME),
         m_appVlanTableProducer(appDb, APP_VLAN_TABLE_NAME),
         m_appVlanMemberTableProducer(appDb, APP_VLAN_MEMBER_TABLE_NAME),
+        m_appFdbTableProducer(appDb, APP_FDB_TABLE_NAME),
+        m_appPortTableProducer(appDb, APP_PORT_TABLE_NAME),
         replayDone(false)
 {
     SWSS_LOG_ENTER();
@@ -78,7 +82,12 @@ VlanMgr::VlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, c
     //               /sbin/bridge vlan del vid 1 dev Bridge self;
     //               /sbin/ip link del dummy 2>/dev/null;
     //               /sbin/ip link add dummy type dummy &&
-    //               /sbin/ip link set dummy master Bridge"
+    //               /sbin/ip link set dummy master Bridge &&
+    //               /sbin/ip link set dummy up;
+    //               /sbin/ip link set Bridge down &&
+    //               /sbin/ip link set Bridge up"
+    // Note: We shutdown and start-up the Bridge at the end to ensure that its
+    //       link-local IPv6 address matches its MAC address.
 
     const std::string cmds = std::string("")
       + BASH_CMD + " -c \""
@@ -89,29 +98,21 @@ VlanMgr::VlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, c
       + BRIDGE_CMD + " vlan del vid " + DEFAULT_VLAN_ID + " dev " + DOT1Q_BRIDGE_NAME + " self; "
       + IP_CMD + " link del dev dummy 2>/dev/null; "
       + IP_CMD + " link add dummy type dummy && "
-      + IP_CMD + " link set dummy master " + DOT1Q_BRIDGE_NAME + "\"";
+      + IP_CMD + " link set dummy master " + DOT1Q_BRIDGE_NAME + " && "
+      + IP_CMD + " link set dummy up; "
+      + IP_CMD + " link set " + DOT1Q_BRIDGE_NAME + " down && "
+      + IP_CMD + " link set " + DOT1Q_BRIDGE_NAME + " up\"";
 
     std::string res;
     EXEC_WITH_ERROR_THROW(cmds, res);
 
-    // The generated command is:
-    // /bin/echo 1 > /sys/class/net/Bridge/bridge/vlan_filtering
-    const std::string echo_cmd = std::string("")
-      + ECHO_CMD + " 1 > /sys/class/net/" + DOT1Q_BRIDGE_NAME + "/bridge/vlan_filtering";
+    // /sbin/ip link set Bridge type bridge vlan_filtering 1
+    const std::string vlan_filtering_cmd = std::string(IP_CMD) + " link set " + DOT1Q_BRIDGE_NAME + " type bridge vlan_filtering 1";
+    EXEC_WITH_ERROR_THROW(vlan_filtering_cmd, res);
 
-    int ret = swss::exec(echo_cmd, res);
-    /* echo will fail in virtual switch since /sys directory is read-only.
-     * need to use ip command to setup the vlan_filtering which is not available in debian 8.
-     * Once we move sonic to debian 9, we can use IP command by default
-     * ip command available in Debian 9 to create a bridge with a vlan filtering:
-     * /sbin/ip link add Bridge up type bridge vlan_filtering 1 */
-    if (ret != 0)
-    {
-        const std::string echo_cmd_backup = std::string("")
-          + IP_CMD + " link set " + DOT1Q_BRIDGE_NAME + " type bridge vlan_filtering 1";
-
-        EXEC_WITH_ERROR_THROW(echo_cmd_backup, res);
-    }
+    // /sbin/ip link set Bridge type bridge no_linklocal_learn 1
+    const std::string no_ll_learn_cmd = std::string(IP_CMD) + " link set " + DOT1Q_BRIDGE_NAME + " type bridge no_linklocal_learn 1";
+    EXEC_WITH_ERROR_THROW(no_ll_learn_cmd, res);
 }
 
 bool VlanMgr::addHostVlan(int vlan_id)
@@ -132,6 +133,11 @@ bool VlanMgr::addHostVlan(int vlan_id)
 
     std::string res;
     EXEC_WITH_ERROR_THROW(cmds, res);
+
+    res.clear();
+    const std::string echo_cmd = std::string("")
+      + ECHO_CMD + " 0 > /proc/sys/net/ipv4/conf/" + VLAN_PREFIX + std::to_string(vlan_id) + "/arp_evict_nocarrier";
+    swss::exec(echo_cmd, res);
 
     return true;
 }
@@ -193,14 +199,33 @@ bool VlanMgr::setHostVlanMac(int vlan_id, const string &mac)
 {
     SWSS_LOG_ENTER();
 
+    std::string res;
+
+    /*
+     * Bring down the bridge before changing MAC addresses of the bridge and the VLAN interface.
+     * This is done so that the IPv6 link-local addresses of the bridge and the VLAN interface
+     * are updated after MAC change.
+     * /sbin/ip link set Bridge down
+     */
+    string bridge_down(IP_CMD " link set " DOT1Q_BRIDGE_NAME " down");
+    EXEC_WITH_ERROR_THROW(bridge_down, res);
+
     // The command should be generated as:
-    // /sbin/ip link set Vlan{{vlan_id}} address {{mac}}
+    // /sbin/ip link set Vlan{{vlan_id}} address {{mac}} &&
+    // /sbin/ip link set Bridge address {{mac}}
     ostringstream cmds;
     cmds << IP_CMD " link set " VLAN_PREFIX + std::to_string(vlan_id) + " address " << shellquote(mac) << " && "
             IP_CMD " link set " DOT1Q_BRIDGE_NAME " address " << shellquote(mac);
-
-    std::string res;
+    res.clear();
     EXEC_WITH_ERROR_THROW(cmds.str(), res);
+
+    /*
+     * Start up the bridge again.
+     * /sbin/ip link set Bridge up
+     */
+    string bridge_up(IP_CMD " link set " DOT1Q_BRIDGE_NAME " up");
+    res.clear();
+    EXEC_WITH_ERROR_THROW(bridge_up, res);
 
     return true;
 }
@@ -226,7 +251,23 @@ bool VlanMgr::addHostVlanMember(int vlan_id, const string &port_alias, const str
     cmds << BASH_CMD " -c " << shellquote(inner.str());
 
     std::string res;
-    EXEC_WITH_ERROR_THROW(cmds.str(), res);
+    try
+    {
+        EXEC_WITH_ERROR_THROW(cmds.str(), res);
+    }
+    catch (const std::runtime_error& e)
+    {
+        // Race conidtion can happen with portchannel removal might happen
+	// but state db is not updated yet so we can do retry instead of sending exception
+	if (!port_alias.compare(0, strlen(LAG_PREFIX), LAG_PREFIX))
+	{
+            return false;
+	}
+        else
+	{
+            EXEC_WITH_ERROR_THROW(cmds.str(), res);
+	}
+    }
 
     return true;
 }
@@ -237,19 +278,27 @@ bool VlanMgr::removeHostVlanMember(int vlan_id, const string &port_alias)
 
     // The command should be generated as:
     // /bin/bash -c '/sbin/bridge vlan del vid {{vlan_id}} dev {{port_alias}} &&
-    //               ( /sbin/bridge vlan show dev {{port_alias}} | /bin/grep -q None;
-    //               ret=$?; if [ $ret -eq 0 ]; then
+    //               ( vlanShow=$(/sbin/bridge vlan show dev {{port_alias}});
+    //               ret=$?;
+    //               if [ $ret -eq 0 ]; then
+    //               if (! echo "$vlanShow" | grep -q {{port_alias}})
+    //                 || (echo "$vlanShow" | grep -q None$)
+    //                 || (echo "$vlanShow" | grep -q {{port_alias}}$); then
     //               /sbin/ip link set {{port_alias}} nomaster;
-    //               elif [ $ret -eq 1 ]; then exit 0;
+    //               fi;
     //               else exit $ret; fi )'
 
     // When port is not member of any VLAN, it shall be detached from Dot1Q bridge!
     ostringstream cmds, inner;
     inner << BRIDGE_CMD " vlan del vid " + std::to_string(vlan_id) + " dev " << shellquote(port_alias) << " && ( "
-      BRIDGE_CMD " vlan show dev " << shellquote(port_alias) << " | "
-      GREP_CMD " -q None; ret=$?; if [ $ret -eq 0 ]; then "
+      "vlanShow=$(" BRIDGE_CMD " vlan show dev " << shellquote(port_alias) << "); "
+      "ret=$?; "
+      "if [ $ret -eq 0 ]; then "
+      "if (! echo \"$vlanShow\" | " GREP_CMD " -q " << shellquote(port_alias) << ") "
+      " || (echo \"$vlanShow\" | " GREP_CMD " -q None$) "
+      " || (echo \"$vlanShow\" | " GREP_CMD " -q " << shellquote(port_alias) << "$); then "
       IP_CMD " link set " << shellquote(port_alias) << " nomaster; "
-      "elif [ $ret -eq 1 ]; then exit 0; "
+      "fi; "
       "else exit $ret; fi )";
     cmds << BASH_CMD " -c " << shellquote(inner.str());
 
@@ -321,10 +370,10 @@ void VlanMgr::doVlanTask(Consumer &consumer)
              */
             if (isVlanStateOk(key) && m_vlans.find(key) == m_vlans.end())
             {
+                SWSS_LOG_DEBUG("%s already created", kfvKey(t).c_str());
                 m_vlans.insert(key);
                 m_vlanReplay.erase(kfvKey(t));
                 it = consumer.m_toSync.erase(it);
-                SWSS_LOG_DEBUG("%s already created", kfvKey(t).c_str());
                 continue;
             }
 
@@ -417,13 +466,13 @@ void VlanMgr::doVlanTask(Consumer &consumer)
             {
                 SWSS_LOG_ERROR("%s doesn't exist", key.c_str());
             }
-            SWSS_LOG_DEBUG("%s", (dumpTuple(consumer, t)).c_str());
+            SWSS_LOG_DEBUG("%s", (consumer.dumpTuple(t)).c_str());
             it = consumer.m_toSync.erase(it);
         }
         else
         {
             SWSS_LOG_ERROR("Unknown operation type %s", op.c_str());
-            SWSS_LOG_DEBUG("%s", (dumpTuple(consumer, t)).c_str());
+            SWSS_LOG_DEBUG("%s", (consumer.dumpTuple(t)).c_str());
             it = consumer.m_toSync.erase(it);
         }
     }
@@ -453,6 +502,11 @@ bool VlanMgr::isMemberStateOk(const string &alias)
     }
     else if (m_statePortTable.get(alias, temp))
     {
+        auto state_opt = swss::fvsGetValue(temp, "state", true);
+        if (!state_opt)
+        {
+            return false;
+        }
         SWSS_LOG_DEBUG("%s is ready", alias.c_str());
         return true;
     }
@@ -520,7 +574,7 @@ void VlanMgr::processUntaggedVlanMembers(string vlan, const string &members)
             fvVector.push_back(t);
             KeyOpFieldsValuesTuple tuple = make_tuple(member_key, SET_COMMAND, fvVector);
             consumer.addToSync(tuple);
-            SWSS_LOG_DEBUG("%s", (dumpTuple(consumer, tuple)).c_str());
+            SWSS_LOG_DEBUG("%s", (consumer.dumpTuple(tuple)).c_str());
         }
         /*
          * There is pending task from consumer pipe, in this case just skip it.
@@ -623,6 +677,13 @@ void VlanMgr::doVlanMemberTask(Consumer &consumer)
                 m_stateVlanMemberTable.set(kfvKey(t), fvVector);
 
                 m_vlanMemberReplay.erase(kfvKey(t));
+                m_PortVlanMember[port_alias][vlan_alias] = tagging_mode;
+            }
+            else
+            {
+                SWSS_LOG_INFO("Netdevice for  %s not ready, delaying", kfvKey(t).c_str());
+                it++;
+                continue;
             }
         }
         else if (op == DEL_COMMAND)
@@ -635,12 +696,13 @@ void VlanMgr::doVlanMemberTask(Consumer &consumer)
                 key += port_alias;
                 m_appVlanMemberTableProducer.del(key);
                 m_stateVlanMemberTable.del(kfvKey(t));
+                m_PortVlanMember[port_alias].erase(vlan_alias);
             }
             else
             {
                 SWSS_LOG_DEBUG("%s doesn't exist", kfvKey(t).c_str());
             }
-            SWSS_LOG_DEBUG("%s", (dumpTuple(consumer, t)).c_str());
+            SWSS_LOG_DEBUG("%s", (consumer.dumpTuple(t)).c_str());
         }
         else
         {
@@ -661,6 +723,257 @@ void VlanMgr::doVlanMemberTask(Consumer &consumer)
     }
 }
 
+void VlanMgr::doVlanPacPortTask(Consumer &consumer)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = consumer.m_toSync.begin();
+    while (it != consumer.m_toSync.end())
+    {
+        auto &t = it->second;
+        string alias = kfvKey(t);
+        string op = kfvOp(t);
+
+        SWSS_LOG_DEBUG("processing %s operation %s", alias.c_str(),
+                                   op.empty() ? "none" : op.c_str());
+
+        if (op == SET_COMMAND)
+        {
+            string learn_mode;
+            for (auto i : kfvFieldsValues(t))
+            {
+                if (fvField(i) == "learn_mode")
+                {
+                    learn_mode = fvValue(i);
+                }
+            }
+            if (!learn_mode.empty())
+            {
+                SWSS_LOG_NOTICE("set port learn mode port %s learn_mode %s\n", alias.c_str(), learn_mode.c_str());
+                vector<FieldValueTuple> fvVector;
+                FieldValueTuple portLearnMode("learn_mode", learn_mode);
+                fvVector.push_back(portLearnMode);
+                m_appPortTableProducer.set(alias, fvVector);
+            }
+        }
+        else if (op == DEL_COMMAND)
+        {
+            if (isMemberStateOk(alias))
+            {
+                vector<FieldValueTuple> fvVector;
+                FieldValueTuple portLearnMode("learn_mode", "hardware");
+                fvVector.push_back(portLearnMode);
+                m_appPortTableProducer.set(alias, fvVector);
+            }
+        }
+        it = consumer.m_toSync.erase(it);
+    }
+}
+
+void VlanMgr::doVlanPacFdbTask(Consumer &consumer)
+{
+    auto it = consumer.m_toSync.begin();
+
+    while (it != consumer.m_toSync.end())
+    {
+        KeyOpFieldsValuesTuple t = it->second;
+
+        /* format: <VLAN_name>|<MAC_address> */
+        vector<string> keys = tokenize(kfvKey(t), config_db_key_delimiter, 1);
+        /* keys[0] is vlan as (Vlan10) and keys[1] is mac as (00-00-00-00-00-00) */
+        string op = kfvOp(t);
+
+        SWSS_LOG_NOTICE("VlanMgr process static MAC vlan: %s mac: %s ", keys[0].c_str(), keys[1].c_str());
+
+        int vlan_id;
+        vlan_id = stoi(keys[0].substr(4));
+
+        if (!m_vlans.count(keys[0]))
+        {
+            SWSS_LOG_NOTICE("Vlan %s not available yet, mac %s", keys[0].c_str(), keys[1].c_str());
+            it++;
+            continue;
+        }
+
+        MacAddress mac = MacAddress(keys[1]);
+
+        string key = VLAN_PREFIX + to_string(vlan_id);
+        key += DEFAULT_KEY_SEPARATOR;
+        key += mac.to_string();
+
+        if (op == SET_COMMAND)
+        {
+            string port, discard = "false", type = "static";
+            for (auto i : kfvFieldsValues(t))
+            {
+                if (fvField(i) == "port")
+                {
+                    port = fvValue(i);
+                }
+                if (fvField(i) == "discard")
+                {
+                    discard = fvValue(i);
+                }
+                if (fvField(i) == "type")
+                {
+                    type = fvValue(i);
+                }
+            }
+            SWSS_LOG_NOTICE("PAC FDB SET %s port %s discard %s type %s\n",
+                key.c_str(), port.c_str(), discard.c_str(), type.c_str());
+            vector<FieldValueTuple> fvVector;
+            FieldValueTuple p("port", port);
+            fvVector.push_back(p);
+            FieldValueTuple t("type", type);
+            fvVector.push_back(t);
+            FieldValueTuple d("discard", discard);
+            fvVector.push_back(d);
+
+            m_appFdbTableProducer.set(key, fvVector);
+        }
+        else if (op == DEL_COMMAND)
+        {
+            m_appFdbTableProducer.del(key);
+        }
+        it = consumer.m_toSync.erase(it);
+    }
+}
+
+void VlanMgr::doVlanPacVlanMemberTask(Consumer &consumer)
+{
+    auto it = consumer.m_toSync.begin();
+    while (it != consumer.m_toSync.end())
+    {
+        auto &t = it->second;
+
+        string key = kfvKey(t);
+
+        key = key.substr(4);
+        size_t found = key.find(CONFIGDB_KEY_SEPARATOR);
+        int vlan_id = 0;
+        string vlan_alias, port_alias;
+        if (found != string::npos)
+        {
+            vlan_id = stoi(key.substr(0, found));
+            port_alias = key.substr(found+1);
+        }
+
+        vlan_alias = VLAN_PREFIX + to_string(vlan_id);
+        string op = kfvOp(t);
+
+        if (op == SET_COMMAND)
+        {
+            /* Don't proceed if member port/lag is not ready yet */
+            if (!isMemberStateOk(port_alias) || !isVlanStateOk(vlan_alias))
+            {
+                SWSS_LOG_DEBUG("%s not ready, delaying", kfvKey(t).c_str());
+                it++;
+                continue;
+            }
+            string tagging_mode = "untagged";
+            auto vlans = m_PortVlanMember[port_alias];
+            for (const auto& vlan : vlans)
+            {
+                string vlan_alias = vlan.first;
+                removePortFromVlan(port_alias, vlan_alias);
+            }
+            SWSS_LOG_NOTICE("Add Vlan Member key: %s", kfvKey(t).c_str());
+            if (addHostVlanMember(vlan_id, port_alias, tagging_mode))
+            {
+                key = VLAN_PREFIX + to_string(vlan_id);
+                key += DEFAULT_KEY_SEPARATOR;
+                key += port_alias;
+                vector<FieldValueTuple> fvVector = kfvFieldsValues(t);
+                FieldValueTuple s("dynamic", "yes");
+                fvVector.push_back(s);
+                m_appVlanMemberTableProducer.set(key, fvVector);
+
+                vector<FieldValueTuple> fvVector1;
+                FieldValueTuple s1("state", "ok");
+                fvVector.push_back(s1);
+                m_stateVlanMemberTable.set(kfvKey(t), fvVector);
+            }
+        }
+        else if (op == DEL_COMMAND)
+        {
+            if (isVlanMemberStateOk(kfvKey(t)))
+            {
+                SWSS_LOG_NOTICE("Remove Vlan Member key: %s", kfvKey(t).c_str());
+                removeHostVlanMember(vlan_id, port_alias);
+                key = VLAN_PREFIX + to_string(vlan_id);
+                key += DEFAULT_KEY_SEPARATOR;
+                key += port_alias;
+                m_appVlanMemberTableProducer.del(key);
+                m_stateVlanMemberTable.del(kfvKey(t));
+            }
+
+            auto vlans = m_PortVlanMember[port_alias];
+            for (const auto& vlan : vlans)
+            {
+                string vlan_alias = vlan.first;
+                string tagging_mode = vlan.second;
+                SWSS_LOG_NOTICE("Add Vlan Member vlan: %s port %s tagging_mode %s",
+                    vlan_alias.c_str(), port_alias.c_str(), tagging_mode.c_str());
+                addPortToVlan(port_alias, vlan_alias, tagging_mode);
+            }
+        }
+        /* Other than the case of member port/lag is not ready, no retry will be performed */
+        it = consumer.m_toSync.erase(it);
+    }
+}
+
+void VlanMgr::addPortToVlan(const std::string& membername, const std::string& vlan_alias,
+        const std::string& tagging_mode)
+{
+    SWSS_LOG_NOTICE("member %s vlan %s tagging_mode %s",
+        membername.c_str(), vlan_alias.c_str(), tagging_mode.c_str());
+    int vlan_id = stoi(vlan_alias.substr(4));
+    if (addHostVlanMember(vlan_id, membername, tagging_mode))
+    {
+        std::string key = VLAN_PREFIX + to_string(vlan_id);
+        key += DEFAULT_KEY_SEPARATOR;
+        key += membername;
+        vector<FieldValueTuple> fvVector;
+        FieldValueTuple s("tagging_mode", tagging_mode);
+        fvVector.push_back(s);
+        FieldValueTuple s1("dynamic", "no");
+        fvVector.push_back(s1);
+        SWSS_LOG_INFO("key: %s\n", key.c_str());
+        m_appVlanMemberTableProducer.set(key, fvVector);
+
+        vector<FieldValueTuple> fvVector1;
+        FieldValueTuple s2("state", "ok");
+        fvVector1.push_back(s2);
+        key = VLAN_PREFIX + to_string(vlan_id);
+        key += '|';
+        key += membername;
+        m_stateVlanMemberTable.set(key, fvVector1);
+    }
+}
+
+void VlanMgr::removePortFromVlan(const std::string& membername, const std::string& vlan_alias)
+{
+    SWSS_LOG_NOTICE("member %s vlan %s",
+        membername.c_str(), vlan_alias.c_str());
+    int vlan_id = stoi(vlan_alias.substr(4));
+    std::string key = VLAN_PREFIX + to_string(vlan_id);
+    key += '|';
+    key += membername;
+    if (isVlanMemberStateOk(key))
+    {
+        key = VLAN_PREFIX + to_string(vlan_id);
+        key += ':';
+        key += membername;
+        SWSS_LOG_INFO("key: %s\n", key.c_str());
+        m_appVlanMemberTableProducer.del(key);
+
+        key = VLAN_PREFIX + to_string(vlan_id);
+        key += '|';
+        key += membername;
+        m_stateVlanMemberTable.del(key);
+    }
+}
+
 void VlanMgr::doTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
@@ -674,6 +987,18 @@ void VlanMgr::doTask(Consumer &consumer)
     else if (table_name == CFG_VLAN_MEMBER_TABLE_NAME)
     {
         doVlanMemberTask(consumer);
+    }
+    else if (table_name == STATE_OPER_PORT_TABLE_NAME)
+    {
+        doVlanPacPortTask(consumer);
+    }
+    else if (table_name == STATE_OPER_FDB_TABLE_NAME)
+    {
+        doVlanPacFdbTask(consumer);
+    }
+    else if (table_name == STATE_OPER_VLAN_MEMBER_TABLE_NAME)
+    {
+        doVlanPacVlanMemberTask(consumer);
     }
     else
     {

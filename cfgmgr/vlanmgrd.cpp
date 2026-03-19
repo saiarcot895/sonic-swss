@@ -23,22 +23,6 @@ using namespace swss;
 
 MacAddress gMacAddress;
 
-/*
- * Following global variables are defined here for the purpose of
- * using existing Orch class which is to be refactored soon to
- * eliminate the direct exposure of the global variables.
- *
- * Once Orch class refactoring is done, these global variables
- * should be removed from here.
- */
-int gBatchSize = 0;
-bool gSwssRecord = false;
-bool gLogRotate = false;
-ofstream gRecordOfs;
-string gRecordFile;
-/* Global database mutex */
-mutex gDbMutex;
-
 int main(int argc, char **argv)
 {
     Logger::linkToDbNative("vlanmgrd");
@@ -52,7 +36,11 @@ int main(int argc, char **argv)
             CFG_VLAN_TABLE_NAME,
             CFG_VLAN_MEMBER_TABLE_NAME,
         };
-
+        vector<string> state_vlan_tables = {
+            STATE_OPER_PORT_TABLE_NAME,
+            STATE_OPER_FDB_TABLE_NAME,
+            STATE_OPER_VLAN_MEMBER_TABLE_NAME
+        };
         DBConnector cfgDb("CONFIG_DB", 0);
         DBConnector appDb("APPL_DB", 0);
         DBConnector stateDb("STATE_DB", 0);
@@ -74,7 +62,7 @@ int main(int argc, char **argv)
         }
         gMacAddress = MacAddress(it->second);
 
-        VlanMgr vlanmgr(&cfgDb, &appDb, &stateDb, cfg_vlan_tables);
+        VlanMgr vlanmgr(&cfgDb, &appDb, &stateDb, cfg_vlan_tables, state_vlan_tables);
 
         std::vector<Orch *> cfgOrchList = {&vlanmgr};
 

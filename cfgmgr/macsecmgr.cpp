@@ -34,6 +34,20 @@ constexpr std::uint64_t RETRY_TIME = 30;
 /* retry interval, in millisecond */
 constexpr std::uint64_t RETRY_INTERVAL = 100;
 
+/*
+ * The input cipher_str is the encoded string which can be either of length 66 bytes or 130 bytes.
+ *
+ * 66 bytes of length, for 128-byte cipher suite
+ *   - first 2 bytes of the string will be the index from the magic salt string.
+ *   - remaining 64 bytes will be encoded string from the 32-byte plain text CAK input string.
+ *
+ * 130 bytes of length, for 256-byte cipher suite
+ *   - first 2 bytes of the string will be the index from the magic salt string.
+ *   - remaining 128 bytes will be encoded string from the 32 byte plain text CAK input string.
+*/
+constexpr std::size_t AES_LEN_128_BYTE = 66;
+constexpr std::size_t AES_LEN_256_BYTE = 130;
+
 static void lexical_convert(const std::string &policy_str, MACsecMgr::MACsecProfile::Policy & policy)
 {
     SWSS_LOG_ENTER();
@@ -76,6 +90,60 @@ static void lexical_convert(const std::string &cipher_str, MACsecMgr::MACsecProf
     {
         throw std::invalid_argument("Invalid cipher_suite : " + cipher_str);
     }
+}
+
+
+
+/* Decodes a Type 7 encoded input.
+ *
+ * The Type 7 encoding consists of two decimal digits(encoding the salt), followed a series of hexadecimal characters,
+ * two for every byte in the encoded password. An example encoding(of "password") is 044B0A151C36435C0D.
+ * This has a salt/offset of 4 (04 in the example), and encodes password via 4B0A151C36435C0D.
+ *
+ * The algorithm is a straightforward XOR Cipher that relies on the following ascii-encoded 53-byte constant:
+ *    "dsfd;kfoA,.iyewrkldJKDHSUBsgvca69834ncxv9873254k;fg87"
+ *
+ * Decode()
+ *    Get the salt index from the first 2 chars
+ *    For each byte in the provided text after the encoded salt:
+ *        j = (salt index + 1) % 53
+ *        XOR the i'th byte of the password with the j'th byte of the magic constant.
+ *        append to the decoded string.
+ */
+static std::string decodeKey(const std::string &cipher_str, const MACsecMgr::MACsecProfile::CipherSuite & cipher_suite)
+{
+    int salts[] = { 0x64, 0x73, 0x66, 0x64, 0x3B, 0x6B, 0x66, 0x6F, 0x41, 0x2C, 0x2E, 0x69, 0x79, 0x65, 0x77, 0x72, 0x6B, 0x6C, 0x64, 0x4A, 0x4B, 0x44, 0x48, 0x53, 0x55, 0x42, 0x73, 0x67, 0x76, 0x63, 0x61, 0x36, 0x39, 0x38, 0x33, 0x34, 0x6E, 0x63, 0x78, 0x76, 0x39, 0x38, 0x37, 0x33, 0x32, 0x35, 0x34, 0x6B, 0x3B, 0x66, 0x67, 0x38, 0x37 };
+
+    std::string decodedPassword = std::string("");
+    std::string cipher_hex_str = std::string("");
+    unsigned int hex_int, saltIdx;
+
+    if ((cipher_suite == MACsecMgr::MACsecProfile::CipherSuite::GCM_AES_128) ||
+        (cipher_suite == MACsecMgr::MACsecProfile::CipherSuite::GCM_AES_XPN_128))
+    {
+        if (cipher_str.length() != AES_LEN_128_BYTE)
+            throw std::invalid_argument("Invalid length for cipher_string : " + cipher_str);
+    }
+    else if ((cipher_suite == MACsecMgr::MACsecProfile::CipherSuite::GCM_AES_256) ||
+             (cipher_suite == MACsecMgr::MACsecProfile::CipherSuite::GCM_AES_XPN_256))
+    {
+        if (cipher_str.length() != AES_LEN_256_BYTE)
+            throw std::invalid_argument("Invalid length for cipher_string : " + cipher_str);
+    }
+
+    // Get the salt index from the cipher_str
+    saltIdx = (unsigned int) stoi(cipher_str.substr(0,2));
+
+    // Convert the hex string (eg: "aabbcc") to hex integers (eg: 0xaa, 0xbb, 0xcc) taking a substring of 2 chars at a time
+    // and do xor with the magic salt string
+    for (size_t i = 2; i < cipher_str.length(); i += 2) {
+        std::stringstream ss;
+        ss << std::hex << cipher_str.substr(i,2);
+        ss >> hex_int;
+        decodedPassword += (char)(hex_int ^ salts[saltIdx++ % (sizeof(salts)/sizeof(salts[0]))]);
+    }
+
+    return decodedPassword;
 }
 
 template<class T>
@@ -148,7 +216,7 @@ static void wpa_cli_commands(
     }
     if (!network_id.empty())
     {
-        wpa_cli_commands(ostream, "set_network", port_name);
+        wpa_cli_commands(ostream, "set_network", network_id);
     }
     wpa_cli_commands(ostream, args...);
 }
@@ -435,14 +503,11 @@ task_process_status MACsecMgr::enableMACsec(
         return task_need_retry;
     }
 
-    // Create MKA Session object
-    auto port = m_macsec_ports.emplace(
-        std::piecewise_construct,
-        std::make_tuple(port_name),
-        std::make_tuple());
-    if (!port.second)
+    // Handle existing macsec profile
+    auto port_itr = m_macsec_ports.find(port_name);
+    if (port_itr != m_macsec_ports.end())
     {
-        if (port.first->second.profile_name == profile_name)
+        if (port_itr->second.profile_name == profile_name)
         {
             SWSS_LOG_NOTICE(
                 "The MACsec profile '%s' on the port '%s' has been loaded",
@@ -455,7 +520,7 @@ task_process_status MACsecMgr::enableMACsec(
             SWSS_LOG_NOTICE(
                 "The MACsec profile '%s' on the port '%s' "
                 "will be replaced by the MACsec profile '%s'",
-                port.first->second.profile_name.c_str(),
+                port_itr->second.profile_name.c_str(),
                 port_name.c_str(),
                 profile_name.c_str());
             auto result = disableMACsec(port_name, port_attr);
@@ -465,6 +530,11 @@ task_process_status MACsecMgr::enableMACsec(
             }
         }
     }
+    // Create MKA Session object
+    auto port = m_macsec_ports.emplace(
+        std::piecewise_construct,
+        std::make_tuple(port_name),
+        std::make_tuple());
     auto & session = port.first->second;
     session.profile_name = profile_name;
     ostringstream ostream;
@@ -547,10 +617,13 @@ bool MACsecMgr::isPortStateOk(const std::string & port_name)
 
     std::vector<FieldValueTuple> temp;
     std::string state;
+    std::string oper_status;
 
     if (m_statePortTable.get(port_name, temp)
         && get_value(temp, "state", state)
-        && state == "ok")
+        && state == "ok"
+        && get_value(temp, "netdev_oper_status", oper_status)
+        && oper_status == "up")
     {
         SWSS_LOG_DEBUG("Port '%s' is ready", port_name.c_str());
         return true;
@@ -696,7 +769,7 @@ bool MACsecMgr::configureMACsec(
             port_name,
             network_id,
             "mka_cak",
-            profile.primary_cak);
+            decodeKey(profile.primary_cak, profile.cipher_suite));
 
         wpa_cli_exec_and_check(
             session.sock,
@@ -711,6 +784,16 @@ bool MACsecMgr::configureMACsec(
             network_id,
             "mka_priority",
             profile.priority);
+
+        if (profile.rekey_period)
+        {
+            wpa_cli_exec_and_check(
+                session.sock,
+                port_name,
+                network_id,
+                "mka_rekey_period",
+                profile.rekey_period);
+        }
 
         wpa_cli_exec_and_check(
             session.sock,
@@ -763,19 +846,78 @@ bool MACsecMgr::unconfigureMACsec(
     const MKASession & session) const
 {
     SWSS_LOG_ENTER();
-    try
+
+    // Retry interface_remove a few times in case wpa_supplicant is slow to
+    // respond. This specifically targets the "command timed out" condition
+    // seen in the field, to reduce spurious Task PORT - SET failures.
+    static constexpr int MAX_INTERFACE_REMOVE_RETRIES = 3;
+
+    for (int attempt = 1; attempt <= MAX_INTERFACE_REMOVE_RETRIES; ++attempt)
     {
-        wpa_cli_exec_and_check(
-            session.sock,
-            "",
-            "",
-            "interface_remove",
-            port_name);
-    }
-    catch(const std::runtime_error & e)
-    {
-        SWSS_LOG_WARN("Disable MACsec fail : %s", e.what());
-        return false;
+        try
+        {
+            wpa_cli_exec_and_check(
+                session.sock,
+                "",
+                "",
+                "interface_remove",
+                port_name);
+
+            // Success on this attempt: no need to retry further.
+            return true;
+        }
+        catch (const std::runtime_error &e)
+        {
+            const std::string error_message = e.what();
+            // Best-effort cleanup semantics for interface_remove:
+            //
+            // 1. If wpa_cli returns "FAIL" for interface_remove, it typically means
+            //    the interface is already gone from wpa_supplicant. From
+            //    macsecmgr's perspective this is equivalent to a successful
+            //    unconfigure, so treat it as success to avoid spurious
+            //    Task PORT - SET failures.
+            if (error_message.find("-> FAIL") != std::string::npos)
+            {
+                SWSS_LOG_NOTICE(
+                    "interface_remove for port '%s' reported error '%s'; "
+                    "treating MACsec unconfigure as best-effort success",
+                    port_name.c_str(),
+                    error_message.c_str());
+                return true;
+            }
+
+            // 2. If the command times out, retry up to
+            //    MAX_INTERFACE_REMOVE_RETRIES times. If all retries still time
+            //    out, fall back to best-effort semantics: stopWPASupplicant()
+            //    will still be invoked by the caller and will tear down the
+            //    wpa_supplicant process (and its interfaces).
+            if (error_message.find("command timed out") != std::string::npos)
+            {
+                if (attempt < MAX_INTERFACE_REMOVE_RETRIES)
+                {
+                    SWSS_LOG_WARN(
+                        "interface_remove for port '%s' attempt %d/%d timed out: '%s'; retrying after 10 seconds",
+                        port_name.c_str(),
+                        attempt,
+                        MAX_INTERFACE_REMOVE_RETRIES,
+                        error_message.c_str());
+                    std::this_thread::sleep_for(std::chrono::seconds(10));
+                    continue;
+                }
+
+                SWSS_LOG_NOTICE(
+                    "interface_remove for port '%s' timed out after %d attempts: '%s'; "
+                    "ignoring timeouts and treating MACsec unconfigure as best-effort success",
+                    port_name.c_str(),
+                    MAX_INTERFACE_REMOVE_RETRIES,
+                    error_message.c_str());
+                return true;
+            }
+
+            // Any other error is treated as a real failure.
+            SWSS_LOG_WARN("Disable MACsec fail : %s", error_message.c_str());
+            return false;
+        }
     }
     return true;
 }
